@@ -1,0 +1,116 @@
+name: Build Tvheadend
+
+on:
+  push:
+    tags:
+      - 'release-g*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'tvheadend git ref (branch, tag, or commit) to build'
+        required: false
+        default: 'master'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.distro }}/${{ matrix.codename }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { distro: debian, codename: trixie, arch: amd64, runner: ubuntu-latest,    image: 'debian:trixie' }
+          - { distro: debian, codename: trixie, arch: arm64, runner: ubuntu-24.04-arm, image: 'debian:trixie' }
+          - { distro: ubuntu, codename: noble,  arch: amd64, runner: ubuntu-latest,    image: 'ubuntu:noble' }
+          - { distro: ubuntu, codename: noble,  arch: arm64, runner: ubuntu-24.04-arm, image: 'ubuntu:noble' }
+
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+
+      - name: Resolve tvheadend ref
+        id: ref
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ inputs.ref }}" >> "$GITHUB_OUTPUT"
+          else
+            tag="${{ github.ref_name }}"
+            echo "value=${tag#release-g}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Clone Tvheadend
+        run: |
+          git clone https://github.com/tvheadend/tvheadend.git src
+          git -C src checkout "${{ steps.ref.outputs.value }}"
+          git -C src log -1 --oneline
+
+      - name: Apply patches
+        run: |
+          set -eu
+          if [ -f patches/series ]; then
+            list=$(sed 's/#.*//;/^[[:space:]]*$/d' patches/series)
+          else
+            list=$(cd patches 2>/dev/null && ls *.patch 2>/dev/null | sort || true)
+          fi
+          for p in $list; do
+            echo "Applying patches/$p"
+            git -C src apply "$GITHUB_WORKSPACE/patches/$p"
+          done
+
+      - name: Build Debian package
+        run: |
+          docker run --rm \
+            -e DEBIAN_FRONTEND=noninteractive \
+            -v "$GITHUB_WORKSPACE:/ws" \
+            -w /ws/src \
+            "${{ matrix.image }}" \
+            bash -euxc '
+              apt-get update -y
+              apt-get install -y \
+                build-essential cmake git git-core pkg-config gettext debhelper lsb-release \
+                wget bzip2 ca-certificates python3 python3-requests \
+                zlib1g-dev libssl-dev liburiparser-dev libdvbcsa-dev libavahi-client-dev libpcre2-dev \
+                libavdevice-dev libdbus-1-dev libhdhomerun-dev libopus-dev libva-dev libvpx-dev \
+                libx264-dev libx265-dev pngquant
+              git config --global --add safe.directory "*"
+              export AUTOBUILD_CONFIGURE_EXTRA="--disable-ffmpeg_static --disable-hdhomerun_static --disable-libfdkaac_static --disable-libmfx_static --disable-libopus_static --disable-libtheora_static --disable-libvorbis_static --disable-libvpx_static --disable-libx264_static --disable-libx265_static --enable-hdhomerun_client --enable-libav --python=python3"
+              ./Autobuild.sh -j"$(nproc)"
+            '
+
+      - name: Collect packages
+        run: |
+          mkdir -p dist
+          cp tvheadend*.deb dist/
+          ls -la dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.distro }}-${{ matrix.codename }}-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Create release
+    if: startsWith(github.ref, 'refs/tags/release-g')
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.deb
+          generate_release_notes: true
