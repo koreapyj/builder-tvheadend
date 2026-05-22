@@ -52,12 +52,7 @@ jobs:
       - name: Apply patches
         run: |
           set -eu
-          if [ -f patches/series ]; then
-            list=$(sed 's/#.*//;/^[[:space:]]*$/d' patches/series)
-          else
-            list=$(cd patches 2>/dev/null && ls *.patch 2>/dev/null | sort || true)
-          fi
-          for p in $list; do
+          for p in $(cd patches && ls *.patch | sort); do
             echo "Applying patches/$p"
             git -C src apply "$GITHUB_WORKSPACE/patches/$p"
           done

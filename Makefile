@@ -58,11 +58,8 @@ prepare: $(SRC)/.git
 ifeq ($(QUILT),1)
 	@mkdir -p $(SRC)/$(PATCHES)
 	@if ls $(PATCHES)/*.patch >/dev/null 2>&1; then cp $(PATCHES)/*.patch $(SRC)/$(PATCHES)/; fi
-	@if [ -f $(PATCHES)/series ]; then \
-		cp $(PATCHES)/series $(SRC)/$(PATCHES)/series; \
-	else \
-		( cd $(SRC)/$(PATCHES) && ls *.patch 2>/dev/null | sort > series || : ); \
-	fi
+	@# quilt needs a series file; generate it fresh from the patch filenames
+	@( cd $(SRC)/$(PATCHES) && ls *.patch 2>/dev/null | sort > series || : )
 	@echo
 	@echo 'Quilt working series staged in $(SRC)/. Next:'
 	@echo '  export QUILTRC=$(QUILTRC)   # or: cp .quiltrc ~/.quiltrc'
@@ -71,12 +68,7 @@ ifeq ($(QUILT),1)
 	@echo '  cd .. && make update'
 else
 	@set -e; \
-	if [ -f $(PATCHES)/series ]; then \
-		list=$$(sed 's/#.*//;/^[[:space:]]*$$/d' $(PATCHES)/series); \
-	else \
-		list=$$(cd $(PATCHES) 2>/dev/null && ls *.patch 2>/dev/null | sort || true); \
-	fi; \
-	for p in $$list; do \
+	for p in $$(cd $(PATCHES) && ls *.patch | sort); do \
 		echo "Applying $(PATCHES)/$$p"; \
 		git -C $(SRC) apply "$(CURDIR)/$(PATCHES)/$$p"; \
 	done
@@ -101,8 +93,7 @@ update:
 	@mkdir -p $(PATCHES)
 	@rm -f $(PATCHES)/*.patch
 	@if ls $(SRC)/$(PATCHES)/*.patch >/dev/null 2>&1; then cp $(SRC)/$(PATCHES)/*.patch $(PATCHES)/; fi
-	@if [ -f $(SRC)/$(PATCHES)/series ]; then cp $(SRC)/$(PATCHES)/series $(PATCHES)/series; fi
-	@echo "Series copied back to $(PATCHES)/ — review and commit."
+	@echo "Patches copied back to $(PATCHES)/ — review and commit."
 
 refresh:
 	@test -d $(SRC)/$(PATCHES) || { echo "Run 'make prepare QUILT=1' first"; exit 1; }

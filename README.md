@@ -36,20 +36,38 @@ only; they do not create a Release.
 
 ## Patches
 
-`patches/` holds an OpenWrt-style quilt series: numbered `NNN-shortname.patch` files plus a
-`series` file. CI applies the series with `git apply`.
+`patches/` holds an OpenWrt-style quilt series of numbered `NNN-shortname.patch` files. There
+is no `series` file — CI applies the patches with `git apply` in `ls | sort` order, so the
+numeric `NNN` prefix *is* the apply order.
 
-Included patches:
+Included patches — the **`00x`** range is generic upstream bug fixes; **`1xx`** is the
+ARIB / ISDB feature patches:
 
-- **`010-aribb24-text-encoding.patch`** — adds **ARIB STD-B24** (Japanese ISDB) text
+- **`001-dvr-subscription-title-utf8.patch`** — fixes the web UI websocket dying once a
+  recording exists. Tvheadend builds the recording's subscription title with
+  `snprintf(buf, …, "DVR: %s", title)` into a fixed buffer; a long title (Japanese is
+  3 bytes per character) gets truncated mid-UTF-8-character, and that invalid string is
+  streamed in the comet status feed — the browser rejects the non-UTF-8 frame and closes the
+  socket. The patch trims the dangling partial character with `utf8_validate_inplace()`.
+  Not ARIB-specific — a generic Tvheadend buffer-truncation bug that long multibyte titles
+  expose.
+- **`002-isdb-s-linuxdvb-tune.patch`** — fixes ISDB-S tuning on Linux DVB adapters.
+  Tvheadend already has ISDB-S support throughout (FE type, delivery system, network / mux /
+  frontend classes, S2API tune commands), but the legacy parameter-copy `switch` in
+  `linuxdvb_frontend_tune()` is missing the `DVB_TYPE_ISDB_S` case, so every ISDB-S tune hits
+  the `default` arm, logs `unknown FE type 9`, and returns `SM_CODE_TUNING_FAILED` before the
+  S2API path runs. The patch adds `case DVB_TYPE_ISDB_S` to the `ISDB_T`/`DAB` group — ISDB-S,
+  like ISDB-T, carries no legacy `dvb_frontend_parameters` data and is tuned purely via the
+  S2API. Not ARIB-specific — a generic upstream bug that blocks all ISDB-S reception.
+- **`110-aribb24-text-encoding.patch`** — adds **ARIB STD-B24** (Japanese ISDB) text
   decoding via `libaribb24`, exposed as an `ARIB-STD-B24` option in the *Character set*
   dropdown (network / mux / service). When selected, every SI/EPG string from that tuner is
   decoded as ARIB STD-B24. Built in via `--enable-aribb24` (needs `libaribb24-dev`).
-- **`020-aribb24-subtitle.patch`** — recognises ARIB STD-B24 caption (subtitle) elementary
+- **`120-aribb24-subtitle.patch`** — recognises ARIB STD-B24 caption (subtitle) elementary
   streams in ISDB PMTs (`stream_type 0x06` + ARIB data-component descriptor) as a new
   `ARIBSUB` component type, so their PID is filtered, passed through into recordings / TS
   streams, and shown in the web UI. Passthrough only — captions are carried, not rendered.
-- **`030-aribb24-epg.patch`** — teaches the OTA EIT grabber the **ARIB STD-B10** EPG
+- **`130-aribb24-epg.patch`** — teaches the OTA EIT grabber the **ARIB STD-B10** EPG
   semantics used by ISDB. Descriptors: the content descriptor (`0x54`) genres are remapped
   from the ARIB genre table to the nearest DVB ETSI genre; the series descriptor (`0xD5`)
   supplies episode / total-episode numbers and a serieslink; the extended-event (`0x4E`)
@@ -61,37 +79,21 @@ Included patches:
   makes `epg_broadcast_change_finish()` wipe the title/genre/description a fuller pass set
   (which made entries flicker between filled and empty). The ARIB descriptor paths activate
   only for services whose *Character set* is `ARIB-STD-B24`.
-- **`040-dvr-subscription-title-utf8.patch`** — fixes the web UI websocket dying once a
-  recording exists. Tvheadend builds the recording's subscription title with
-  `snprintf(buf, …, "DVR: %s", title)` into a fixed buffer; a long title (Japanese is
-  3 bytes per character) gets truncated mid-UTF-8-character, and that invalid string is
-  streamed in the comet status feed — the browser rejects the non-UTF-8 frame and closes the
-  socket. The patch trims the dangling partial character with `utf8_validate_inplace()`.
-  Not ARIB-specific — a generic Tvheadend buffer-truncation bug that long multibyte titles
-  expose.
-- **`050-isdb-cdt-logo.patch`** — extracts **ISDB station logos** from the CDT (Common Data
+- **`150-isdb-cdt-logo.patch`** — extracts **ISDB station logos** from the CDT (Common Data
   Table, PID `0x29`) and uses them as channel icons. ISDB broadcasts each broadcaster's logo
   as a palettised PNG with the `PLTE`/`tRNS` chunks stripped; the patch parses the CDT,
   rebuilds the PNG from the fixed 129-entry ARIB logo CLUT, writes it under
   `<config>/isdb_logos/`, and sets it as the icon of every channel of the matching service
   (matched via the SDT `logo_transmission_descriptor`, tag `0xCF`). Terrestrial logos — BS/CS
-  use a DSM-CC carousel (patch 051). A user-set channel icon is never overwritten.
-- **`051-isdb-dsmcc-logo.patch`** — extracts **BS/CS** station logos, which (unlike
+  use a DSM-CC carousel (patch 151). A user-set channel icon is never overwritten.
+- **`151-isdb-dsmcc-logo.patch`** — extracts **BS/CS** station logos, which (unlike
   terrestrial) ride a **DSM-CC data carousel** rather than the CDT. When a PMT advertises a
   data ES tagged `component_tag 0x79`/`0x7A` (the ARIB TR-B15 logo carousel), tvheadend opens
   a DSM-CC handler on it: a DII (`table_id 0x3B`) announces the `LOGO-05`/`CS_LOGO-05` module,
   DDB sections (`0x3C`) carry it block-by-block, and the reassembled module's per-service
-  logos are reconstructed and applied exactly as for the CDT (patch 050). Implemented to the
+  logos are reconstructed and applied exactly as for the CDT (patch 150). Implemented to the
   ARIB TR-B15 spec — it needs a transport that actually carries the carousel (a real ISDB-S
   tuner, or a full-transponder stream); service-filtered IPTV streams strip it.
-- **`060-isdb-s-linuxdvb-tune.patch`** — fixes ISDB-S tuning on Linux DVB adapters.
-  Tvheadend already has ISDB-S support throughout (FE type, delivery system, network / mux /
-  frontend classes, S2API tune commands), but the legacy parameter-copy `switch` in
-  `linuxdvb_frontend_tune()` is missing the `DVB_TYPE_ISDB_S` case, so every ISDB-S tune hits
-  the `default` arm, logs `unknown FE type 9`, and returns `SM_CODE_TUNING_FAILED` before the
-  S2API path runs. The patch adds `case DVB_TYPE_ISDB_S` to the `ISDB_T`/`DAB` group — ISDB-S,
-  like ISDB-T, carries no legacy `dvb_frontend_parameters` data and is tuned purely via the
-  S2API. Not ARIB-specific — a generic upstream bug that blocks all ISDB-S reception.
 
 ## Local patch development
 
@@ -110,7 +112,7 @@ quilt edit src/foo.c                # add + open a file (repeat per file)
 quilt refresh                       # write the patch into src/patches/
 cd ..
 make build && make run              # compile + run to verify the new behaviour
-make update                         # copy the series back into patches/
+make update                         # copy the .patch files back into patches/
 git add patches/ && git commit
 ```
 
