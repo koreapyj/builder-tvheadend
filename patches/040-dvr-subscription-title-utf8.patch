@@ -1,0 +1,15 @@
+--- a/src/dvr/dvr_rec.c
++++ b/src/dvr/dvr_rec.c
+@@ -95,6 +95,12 @@ dvr_rec_subscribe(dvr_entry_t *de)
+   weight = prio2weight[pri];
+ 
+   snprintf(buf, sizeof(buf), "DVR: %s", lang_str_get(de->de_title, NULL));
++  /* A long title (e.g. Japanese, 3 bytes/char) overflows buf and snprintf
++   * truncates it mid-UTF-8-character, leaving a dangling lead byte. That
++   * invalid string becomes the subscription title and is streamed in the
++   * comet status feed, breaking the web UI's websocket. Trim the partial
++   * trailing character so the subscription title stays valid UTF-8. */
++  utf8_validate_inplace(buf);
+ 
+   if (de->de_owner && de->de_owner[0] != '\0') {
+     aa = access_get_by_username(de->de_owner);

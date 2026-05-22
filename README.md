@@ -61,6 +61,14 @@ Included patches:
   makes `epg_broadcast_change_finish()` wipe the title/genre/description a fuller pass set
   (which made entries flicker between filled and empty). The ARIB descriptor paths activate
   only for services whose *Character set* is `ARIB-STD-B24`.
+- **`040-dvr-subscription-title-utf8.patch`** — fixes the web UI websocket dying once a
+  recording exists. Tvheadend builds the recording's subscription title with
+  `snprintf(buf, …, "DVR: %s", title)` into a fixed buffer; a long title (Japanese is
+  3 bytes per character) gets truncated mid-UTF-8-character, and that invalid string is
+  streamed in the comet status feed — the browser rejects the non-UTF-8 frame and closes the
+  socket. The patch trims the dangling partial character with `utf8_validate_inplace()`.
+  Not ARIB-specific — a generic Tvheadend buffer-truncation bug that long multibyte titles
+  expose.
 
 ## Local patch development
 
