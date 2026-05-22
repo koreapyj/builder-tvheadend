@@ -45,6 +45,10 @@ Included patches:
   decoding via `libaribb24`, exposed as an `ARIB-STD-B24` option in the *Character set*
   dropdown (network / mux / service). When selected, every SI/EPG string from that tuner is
   decoded as ARIB STD-B24. Built in via `--enable-aribb24` (needs `libaribb24-dev`).
+- **`020-aribb24-subtitle.patch`** — recognises ARIB STD-B24 caption (subtitle) elementary
+  streams in ISDB PMTs (`stream_type 0x06` + ARIB data-component descriptor) as a new
+  `ARIBSUB` component type, so their PID is filtered, passed through into recordings / TS
+  streams, and shown in the web UI. Passthrough only — captions are carried, not rendered.
 
 ## Local patch development
 

@@ -1,0 +1,71 @@
+--- a/src/esfilter.h
++++ b/src/esfilter.h
+@@ -57,7 +57,7 @@ extern const idclass_t esfilter_class_ot
+   SCT_MASK(SCT_TELETEXT)
+ 
+ #define ESF_MASK_SUBTIT \
+-  (SCT_MASK(SCT_DVBSUB) | SCT_MASK(SCT_TEXTSUB))
++  (SCT_MASK(SCT_DVBSUB) | SCT_MASK(SCT_TEXTSUB) | SCT_MASK(SCT_ARIBSUB))
+ 
+ #define ESF_MASK_CA \
+   SCT_MASK(SCT_CA)
+--- a/src/esstream.h
++++ b/src/esstream.h
+@@ -66,7 +66,8 @@ enum streaming_component_type {
+   SCT_OPUS,
+   SCT_FLAC,
+   SCT_AC4,
+-  SCT_LAST = SCT_AC4
++  SCT_ARIBSUB, /* ARIB STD-B24 caption / superimpose (ISDB) */
++  SCT_LAST = SCT_ARIBSUB
+ };
+ 
+ #define SCT_MASK(t) (1 << (t))
+@@ -83,7 +84,8 @@ enum streaming_component_type {
+ 
+ #define SCT_ISAV(t) (SCT_ISVIDEO(t) || SCT_ISAUDIO(t))
+ 
+-#define SCT_ISSUBTITLE(t) ((t) == SCT_TEXTSUB || (t) == SCT_DVBSUB)
++#define SCT_ISSUBTITLE(t) ((t) == SCT_TEXTSUB || (t) == SCT_DVBSUB || \
++			(t) == SCT_ARIBSUB)
+ 
+ /**
+  * Stream info, one media component for a service.
+--- a/src/input/mpegts/dvb.h
++++ b/src/input/mpegts/dvb.h
+@@ -177,6 +177,9 @@ struct lang_str;
+ #define DVB_DESC_FREESAT_LCN          0xD3
+ #define DVB_DESC_FREESAT_REGIONS      0xD4
+ 
++/* ARIB STD-B10 (ISDB) */
++#define DVB_DESC_DATA_COMPONENT       0xFD
++
+ /* HBBTV */
+ #define DVB_DESC_APP		      0x00
+ #define DVB_DESC_APP_NAME             0x01
+--- a/src/input/mpegts/dvb_psi_pmt.c
++++ b/src/input/mpegts/dvb_psi_pmt.c
+@@ -463,6 +463,13 @@ dvb_psi_parse_pmt
+           hts_stream_type = SCT_RDS;
+         break;
+ 
++      case DVB_DESC_DATA_COMPONENT:
++        /* ARIB STD-B24 caption / superimpose: stream_type 0x06 carrying a
++         * data_component_descriptor with data_component_id 0x0008. */
++        if(estype == 0x06 && dlen >= 2 && extract_2byte(ptr) == 0x0008)
++          hts_stream_type = SCT_ARIBSUB;
++        break;
++
+       default:
+         break;
+       }
+--- a/src/streaming.c
++++ b/src/streaming.c
+@@ -590,6 +590,7 @@ static struct strtab streamtypetab[] = {
+   { "OPUS",       SCT_OPUS },
+   { "FLAC",       SCT_FLAC },
+   { "AC-4",       SCT_AC4 },
++  { "ARIBSUB",    SCT_ARIBSUB },
+ };
+ 
+ /**
