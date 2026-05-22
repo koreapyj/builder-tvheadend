@@ -4,3 +4,4 @@
 040-dvr-subscription-title-utf8.patch
 050-isdb-cdt-logo.patch
 051-isdb-dsmcc-logo.patch
+060-isdb-s-linuxdvb-tune.patch

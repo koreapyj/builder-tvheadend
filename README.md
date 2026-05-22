@@ -84,6 +84,14 @@ Included patches:
   logos are reconstructed and applied exactly as for the CDT (patch 050). Implemented to the
   ARIB TR-B15 spec — it needs a transport that actually carries the carousel (a real ISDB-S
   tuner, or a full-transponder stream); service-filtered IPTV streams strip it.
+- **`060-isdb-s-linuxdvb-tune.patch`** — fixes ISDB-S tuning on Linux DVB adapters.
+  Tvheadend already has ISDB-S support throughout (FE type, delivery system, network / mux /
+  frontend classes, S2API tune commands), but the legacy parameter-copy `switch` in
+  `linuxdvb_frontend_tune()` is missing the `DVB_TYPE_ISDB_S` case, so every ISDB-S tune hits
+  the `default` arm, logs `unknown FE type 9`, and returns `SM_CODE_TUNING_FAILED` before the
+  S2API path runs. The patch adds `case DVB_TYPE_ISDB_S` to the `ISDB_T`/`DAB` group — ISDB-S,
+  like ISDB-T, carries no legacy `dvb_frontend_parameters` data and is tuned purely via the
+  S2API. Not ARIB-specific — a generic upstream bug that blocks all ISDB-S reception.
 
 ## Local patch development
 

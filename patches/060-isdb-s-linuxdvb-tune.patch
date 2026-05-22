@@ -1,0 +1,10 @@
+--- a/src/input/mpegts/linuxdvb/linuxdvb_frontend.c
++++ b/src/input/mpegts/linuxdvb/linuxdvb_frontend.c
+@@ -1804,6 +1804,7 @@ linuxdvb_frontend_tune0
+     break;
+ #if DVB_API_VERSION >= 5
+   case DVB_TYPE_ISDB_T:
++  case DVB_TYPE_ISDB_S:
+   case DVB_TYPE_DAB:
+     break;
+ #endif
