@@ -49,6 +49,18 @@ Included patches:
   streams in ISDB PMTs (`stream_type 0x06` + ARIB data-component descriptor) as a new
   `ARIBSUB` component type, so their PID is filtered, passed through into recordings / TS
   streams, and shown in the web UI. Passthrough only — captions are carried, not rendered.
+- **`030-aribb24-epg.patch`** — teaches the OTA EIT grabber the **ARIB STD-B10** EPG
+  semantics used by ISDB. Descriptors: the content descriptor (`0x54`) genres are remapped
+  from the ARIB genre table to the nearest DVB ETSI genre; the series descriptor (`0xD5`)
+  supplies episode / total-episode numbers and a serieslink; the extended-event (`0x4E`)
+  key/value detail items — which Tvheadend otherwise discards — are folded into the program
+  description; the event group descriptor (`0xD6`) adds a short relay/shared-event note.
+  It also fixes two ways ISDB EPG entries lost their text: a `short_event` decoding to blank
+  (ASCII / U+3000 padding) no longer overwrites a real title, and a *partial* EIT pass — an
+  EIT[schedule] "basic" segment or a shared/relayed event with no `short_event` — no longer
+  makes `epg_broadcast_change_finish()` wipe the title/genre/description a fuller pass set
+  (which made entries flicker between filled and empty). The ARIB descriptor paths activate
+  only for services whose *Character set* is `ARIB-STD-B24`.
 
 ## Local patch development
 

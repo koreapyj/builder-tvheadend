@@ -1,0 +1,266 @@
+--- a/src/epggrab/module/eit.c
++++ b/src/epggrab/module/eit.c
+@@ -184,6 +184,41 @@ static dvb_string_conv_t _eit_freesat_co
+   { 0x00, NULL }
+ };
+ 
++#if ENABLE_ARIBB24
++/*
++ * ARIB STD-B10 (ISDB / Japanese DTV) EIT specifics.
++ *
++ * Every ARIB code path below is active only for services whose resolved
++ * charset is "ARIB-STD-B24" (set on the network / mux / service), so DVB
++ * networks are entirely unaffected.
++ */
++static inline int _eit_is_arib ( const eit_event_t *ev )
++{
++  return ev->default_charset && !strcmp(ev->default_charset, "ARIB-STD-B24");
++}
++
++/* ARIB content_nibble_level_1 -> nearest DVB ETSI content byte (major level;
++ * sub-genre is intentionally coarse). 0x00 = leave ungenred. */
++static const uint8_t _eit_arib_genre_l1[16] = {
++  0x20, /* 0x0 News / Reporting        -> News / Current affairs    */
++  0x40, /* 0x1 Sports                  -> Sports                    */
++  0x80, /* 0x2 Information / wide-show  -> Social / Political / Eco. */
++  0x10, /* 0x3 Drama                   -> Movie / Drama             */
++  0x60, /* 0x4 Music                   -> Music / Ballet / Dance    */
++  0x30, /* 0x5 Variety                 -> Show / Game show          */
++  0x10, /* 0x6 Movie                   -> Movie / Drama             */
++  0x55, /* 0x7 Anime / Special effects -> Children's: Cartoons      */
++  0x23, /* 0x8 Documentary / Culture   -> News: Documentary         */
++  0x70, /* 0x9 Theatre / Performance   -> Arts / Culture            */
++  0xa0, /* 0xA Hobby / Education       -> Leisure hobbies           */
++  0x80, /* 0xB Welfare                 -> Social / Political / Eco. */
++  0x00, /* 0xC reserved                                             */
++  0x00, /* 0xD reserved                                             */
++  0x00, /* 0xE extension (user nibbles)                             */
++  0x00, /* 0xF other                                                */
++};
++#endif
++
+ /*
+  * Get string
+  */
+@@ -202,6 +237,24 @@ static int _eit_get_string_with_len
+   return dvb_get_string_with_len(dst, dstlen, src, srclen, charset, cptr);
+ }
+ 
++/* True if s holds at least one non-blank character. ARIB EIT pads text with
++ * ASCII spaces and the ideographic space U+3000 (UTF-8 E3 80 80); a short
++ * event whose name is only padding must not overwrite a real title/summary
++ * obtained from another EIT pass. */
++static int _eit_str_has_content ( const char *s )
++{
++  const uint8_t *p = (const uint8_t *)s;
++  while (*p) {
++    if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
++      p++;
++    else if (p[0] == 0xE3 && p[1] == 0x80 && p[2] == 0x80)
++      p += 3;                       /* U+3000 ideographic space */
++    else
++      return 1;
++  }
++  return 0;
++}
++
+ /*
+  * Short Event - 0x4d
+  */
+@@ -224,7 +277,11 @@ static int _eit_desc_short_event
+   if ( (r = _eit_get_string_with_len(mod, buf, sizeof(buf),
+                                      ptr, len, ev->default_charset)) < 0 ) {
+     return -1;
+-  } else if ( r > 1 ) {
++  } else if ( r > 1 && _eit_str_has_content(buf) ) {
++    /* Require real (non-blank) decoded text: an ARIB shared/relayed event
++     * carries a short_event_descriptor whose event_name on the slave service
++     * is empty or only space padding. Adding it would overwrite the real
++     * title obtained from another EIT pass (set_title replaces). */
+     if (!ev->title) ev->title = lang_str_create();
+     lang_str_add(ev->title, buf, lang);
+   }
+@@ -237,7 +294,8 @@ static int _eit_desc_short_event
+   if ( (r = _eit_get_string_with_len(mod, buf, sizeof(buf),
+                                      ptr, len, ev->default_charset)) < 0 ) {
+     return -1;
+-  } else if ( r > 1 ) {
++  } else if ( r > 1 && _eit_str_has_content(buf) ) {
++    /* Non-blank decoded text only — see the title note above. */
+     if (!ev->summary) ev->summary = lang_str_create();
+     lang_str_add(ev->summary, buf, lang);
+   }
+@@ -298,6 +356,21 @@ static int _eit_desc_ext_event
+     ilen -= r;
+     iptr += r;
+ 
++#if ENABLE_ARIBB24
++    /* ARIB carries the real programme detail in these key/value items, not
++     * in the (normally empty) trailing text field below — fold them into the
++     * description so it is not lost. */
++    if (_eit_is_arib(ev) && *ival) {
++      char eline[1100];
++      if (*ikey)
++        snprintf(eline, sizeof(eline), "\n%s\n%s", ikey, ival);
++      else
++        snprintf(eline, sizeof(eline), "%s", ival);
++      if (!ev->desc) ev->desc = lang_str_create();
++      lang_str_append(ev->desc, eline, lang);
++    }
++#endif
++
+     /* Store */
+     // TODO: extend existing?
+ #if TODO_ADD_EXTRA
+@@ -395,6 +468,22 @@ static int _eit_desc_content
+ {
+   uint8_t tempPtr = 0;  //Temporary variable to hold a (potentially) changed *ptr value.
+   tempPtr = *ptr;
++#if ENABLE_ARIBB24
++  /* ARIB uses its own genre table; remap content_nibble_level_1 to the
++   * nearest DVB ETSI genre instead of interpreting the byte as ETSI. */
++  if (_eit_is_arib(ev)) {
++    while (len > 1) {
++      uint8_t g = _eit_arib_genre_l1[(*ptr >> 4) & 0x0f];
++      if (g) {
++        if (!ev->genre) ev->genre = calloc(1, sizeof(epg_genre_list_t));
++        epg_genre_list_add_by_eit(ev->genre, g);
++      }
++      len -= 2;
++      ptr += 2;
++    }
++    return 0;
++  }
++#endif
+   while (len > 1) {
+     //If the genre translation table has been loaded, it will not be a null pointer.
+     if (epggrab_ota_genre_translation){
+@@ -552,6 +641,84 @@ static int _eit_desc_crid
+   return 0;
+ }
+ 
++#if ENABLE_ARIBB24
++/*
++ * ARIB Series Descriptor - 0xD5
++ *
++ * Carries episode numbering for serial ISDB programmes. Payload layout:
++ *   [0..1] series_id
++ *   [2]    repeat_label(4) program_pattern(3) expire_date_valid_flag(1)
++ *   [3..4] expire_date
++ *   [5]    episode_number high 8 bits
++ *   [6]    episode_number low 4 bits | last_episode_number high 4 bits
++ *   [7]    last_episode_number low 8 bits
++ *   [8..]  series_name_char
++ */
++static int _eit_desc_series
++  ( epggrab_module_t *mod, const uint8_t *ptr, int len,
++    eit_event_t *ev, eit_data_t *ed )
++{
++  uint16_t series_id, episode, last;
++
++  if (!_eit_is_arib(ev)) return 0;
++  if (len < 8) return 0;
++
++  series_id = (ptr[0] << 8) | ptr[1];
++  episode   = (ptr[5] << 4) | (ptr[6] >> 4);
++  last      = ((ptr[6] & 0x0f) << 8) | ptr[7];
++
++  tvhtrace(mod->subsys, "%s:  ARIB series id %u episode %u/%u",
++           mod->id, series_id, episode, last);
++
++  if (episode) ev->en.e_num = episode;
++  if (last)    ev->en.e_cnt = last;
++
++  /* Group episodes of the same series, unless a CRID already supplied one. */
++  if (series_id && !ev->suri[0])
++    snprintf(ev->suri, sizeof(ev->suri), "crid://arib-series.%u.%u",
++             ed->onid, series_id);
++
++  return 0;
++}
++
++/*
++ * ARIB Event Group Descriptor - 0xD6
++ *
++ * Describes a relay / shared-event relation. Tvheadend has no data model for
++ * this, so it is surfaced as a short informational note on the description.
++ */
++static int _eit_desc_event_group
++  ( epggrab_module_t *mod, const uint8_t *ptr, int len, eit_event_t *ev )
++{
++  static const char *types[6] = {
++    NULL,
++    "[イベント共有]",
++    "[イベントリレー]",
++    "[イベントリレー]",
++    "[イベントリレー(他NW)]",
++    "[イベント移動(他NW)]",
++  };
++  uint8_t group_type;
++  const char *note;
++
++  if (!_eit_is_arib(ev)) return 0;
++  if (len < 1) return 0;
++
++  group_type = ptr[0] >> 4;
++  tvhtrace(mod->subsys, "%s:  ARIB event group type %u", mod->id, group_type);
++
++  note = group_type < 6 ? types[group_type] : NULL;
++  if (note) {
++    char gline[64];
++    snprintf(gline, sizeof(gline), "\n%s", note);
++    if (!ev->desc) ev->desc = lang_str_create();
++    lang_str_append(ev->desc, gline, "jpn");
++  }
++
++  return 0;
++}
++#endif
++
+ /*
+  *
+  */
+@@ -963,7 +1130,16 @@ static int _eit_process_event_one
+   if (ev->copyright_year > 0)
+     *save |= epg_broadcast_set_copyright_year(ebc, ev->copyright_year, &changes);
+ 
+-  *save |= epg_broadcast_change_finish(ebc, changes, 0);
++  /* A partial EIT pass that carries no short_event descriptor must not be
++   * treated as authoritative. ISDB EIT[schedule] sends "basic" segments
++   * (timing only, no descriptors), and ARIB shared/relayed events appear on
++   * slave services without a short_event. epg_broadcast_change_finish() with
++   * merge=0 wipes every field absent from the current pass, so such a pass
++   * would blank the title/genre/description a fuller pass had provided —
++   * causing the EPG entry to flicker. Pass merge=1 (skip the wipe) whenever
++   * this pass carried no title. */
++  *save |= epg_broadcast_change_finish(ebc, changes,
++                                       !(changes & EPG_CHANGED_TITLE));
+ 
+ 
+ running:
+@@ -1051,6 +1227,14 @@ static int _eit_process_event
+       case DVB_DESC_CRID:
+         r = _eit_desc_crid(mod, ptr, dlen, &ev, ed);
+         break;
++#if ENABLE_ARIBB24
++      case DVB_DESC_ARIB_SERIES:
++        r = _eit_desc_series(mod, ptr, dlen, &ev, ed);
++        break;
++      case DVB_DESC_ARIB_EVENT_GROUP:
++        r = _eit_desc_event_group(mod, ptr, dlen, &ev);
++        break;
++#endif
+       default:
+         r = 0;
+         _eit_dtag_dump(mod, dtag, dlen, ptr);
+--- a/src/input/mpegts/dvb.h
++++ b/src/input/mpegts/dvb.h
+@@ -178,6 +178,8 @@ struct lang_str;
+ #define DVB_DESC_FREESAT_REGIONS      0xD4
+ 
+ /* ARIB STD-B10 (ISDB) */
++#define DVB_DESC_ARIB_SERIES          0xD5
++#define DVB_DESC_ARIB_EVENT_GROUP     0xD6
+ #define DVB_DESC_DATA_COMPONENT       0xFD
+ 
+ /* HBBTV */
