@@ -3,7 +3,7 @@
 
 TVH_REPO    ?= https://github.com/tvheadend/tvheadend.git
 TVH_REF     ?= master
-BUILD_IMAGE ?= debian:trixie
+BUILD_IMAGE ?= ubuntu:noble
 QUILT       ?=
 
 SRC     := src
@@ -14,16 +14,21 @@ QUILTRC := $(CURDIR)/.quiltrc
 # transcoding or Debian packaging.
 BUILD_DEPS := build-essential cmake git pkg-config gettext libavahi-client-dev \
               libssl-dev zlib1g-dev liburiparser-dev libpcre2-dev libdvbcsa-dev \
-              python3 wget bzip2 ca-certificates
+              libaribb24-dev python3 wget bzip2 ca-certificates
 
 # Minimal configure flags — fast, offline, no transcoding / DVB-scan fetch.
-BUILD_CONFIGURE := --disable-ffmpeg_static --disable-hdhomerun_static \
-                   --disable-libav --disable-dvbscan --python=python3
+# --prefix=/usr puts TVHEADEND_DATADIR at /usr/share/tvheadend, matching the
+# Debian package layout (so `make -C src install` lands where dpkg would).
+# ARIB STD-B24 text decoding is kept on so patches to it can be tested locally.
+BUILD_CONFIGURE := --prefix=/usr \
+                   --disable-ffmpeg_static --disable-hdhomerun_static \
+                   --disable-libav --disable-dvbscan --enable-aribb24 \
+                   --python=python3
 
 # Runtime shared libraries needed to *run* the test binary. The -dev package
 # names are stable across releases and pull in the correct SONAME packages.
 RUN_DEPS := libavahi-client-dev libssl-dev zlib1g-dev liburiparser-dev \
-            libpcre2-dev libdvbcsa-dev
+            libpcre2-dev libdvbcsa-dev libaribb24-dev
 
 .DEFAULT_GOAL := help
 .PHONY: help prepare build run update refresh clean
@@ -40,7 +45,7 @@ help:
 	@echo '  refresh            rebase the whole series against current source, then update'
 	@echo '  clean              remove $(SRC)/'
 	@echo
-	@echo 'Variables: TVH_REF (default master), TVH_REPO, BUILD_IMAGE (default debian:trixie)'
+	@echo 'Variables: TVH_REF (default master), TVH_REPO, BUILD_IMAGE (default ubuntu:noble)'
 	@echo
 	@echo 'Patch workflow:  make clean prepare QUILT=1  ->  edit with quilt  ->  make update'
 	@echo 'Test build:      make clean prepare build  ->  make run'

@@ -1,0 +1,131 @@
+--- a/configure
++++ b/configure
+@@ -62,6 +62,7 @@ OPTIONS=(
+   "pcre:auto"
+   "pcre2:auto"
+   "uriparser:auto"
++  "aribb24:auto"
+   "ccache:auto"
+   "tvhcsa:auto"
+   "bundle:no"
+@@ -552,6 +553,17 @@ if enabled_or_auto uriparser; then
+   fi
+ fi
+ 
++#
++# aribb24 (ARIB STD-B24 text decoding for ISDB)
++#
++if enabled_or_auto aribb24; then
++  if check_pkg aribb24; then
++    enable aribb24
++  elif enabled aribb24; then
++    die "aribb24 development support not found (use --disable-aribb24)"
++  fi
++fi
++
+ #
+ # Bundling
+ #
+--- a/src/input/mpegts/dvb_charset.c
++++ b/src/input/mpegts/dvb_charset.c
+@@ -156,6 +156,9 @@ dvb_charset_enum ( void *p, const char *
+     "GB2312",
+     "UCS2",
+     "AUTO_POLISH",
++#if ENABLE_ARIBB24
++    "ARIB-STD-B24",
++#endif
+   };
+   htsmsg_t *m = htsmsg_create_list();
+   for ( i = 0; i < ARRAY_SIZE(charsets); i++)
+--- a/src/input/mpegts/dvb_support.c
++++ b/src/input/mpegts/dvb_support.c
+@@ -34,6 +34,11 @@
+ #include "lang_str.h"
+ #include "settings.h"
+ 
++#if ENABLE_ARIBB24
++#include <aribb24/aribb24.h>
++#include <aribb24/decoder.h>
++#endif
++
+ static int convert_iso_8859[16] = {
+   -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, -1, 11, 12, 13
+ };
+@@ -41,6 +46,7 @@ static int convert_iso_8859[16] = {
+ #define convert_iso6937 15
+ #define convert_ucs2 16
+ #define convert_gb   17
++#define convert_arib 18
+ 
+ #define conv_lower(dst, dstlen, c) \
+   if (c >= 0x20 || c == '\n') { *(dst++) = c; (*dstlen)--; }
+@@ -56,6 +62,37 @@ static inline size_t conv_gb(const uint8
+     return 0;
+ }
+ 
++#if ENABLE_ARIBB24
++/* Decode an ARIB STD-B24 (ISDB / Japanese DTV) text buffer to UTF-8
++ * using libaribb24. A fresh decoder instance is used per call so the
++ * routine is self-contained and thread-safe. */
++static size_t conv_arib(const uint8_t *src, size_t srclen,
++                        char *dst, size_t *dstlen)
++{
++  arib_instance_t *ai;
++  arib_decoder_t *dec;
++  size_t n;
++
++  ai = arib_instance_new(NULL);
++  if (ai == NULL)
++    return -1;
++  dec = arib_get_decoder(ai);
++  if (dec == NULL) {
++    arib_instance_destroy(ai);
++    return -1;
++  }
++  arib_initialize_decoder(dec);
++  n = arib_decode_buffer(dec, (const unsigned char *)src, srclen,
++                         dst, *dstlen);
++  arib_finalize_decoder(dec);
++  arib_instance_destroy(ai);
++  if (n > *dstlen)
++    return -1;
++  *dstlen -= n;
++  return 0;
++}
++#endif
++
+ static inline int encode_utf8(unsigned int c, char *outb, int outleft)
+ {
+   if (c <= 0x7F && outleft >= 1) {
+@@ -247,6 +284,9 @@ static inline size_t dvb_convert(int con
+     case convert_iso6937: return conv_6937(src, srclen, dst, dstlen);
+     case convert_gb: return conv_gb(src,srclen,dst,dstlen);
+     case convert_ucs2:return conv_UCS2(src,srclen,dst,dstlen);
++#if ENABLE_ARIBB24
++    case convert_arib: return conv_arib(src,srclen,dst,dstlen);
++#endif
+     default: return conv_8859(conv, src, srclen, dst, dstlen);
+   }
+ }
+@@ -270,6 +310,20 @@ dvb_get_string
+     return 0;
+   }
+ 
++#if ENABLE_ARIBB24
++  /* ARIB STD-B24 (ISDB): the whole buffer is ARIB-encoded text with no
++   * EN 300 468 encoding-indicator byte — decode it directly, bypassing
++   * the DVB charset auto-detection below. */
++  if (dvb_charset && !strcmp(dvb_charset, "ARIB-STD-B24")) {
++    outlen = dstlen - 1;
++    if (dvb_convert(convert_arib, src, srclen, dst, &outlen) == -1)
++      return -1;
++    len = dstlen - outlen - 1;
++    dst[len] = 0;
++    return 0;
++  }
++#endif
++
+   /* Check custom conversion */
+   while (conv && conv->func) {
+     if (conv->type == src[0])

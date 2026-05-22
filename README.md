@@ -37,8 +37,14 @@ only; they do not create a Release.
 ## Patches
 
 `patches/` holds an OpenWrt-style quilt series: numbered `NNN-shortname.patch` files plus a
-`series` file. It is empty by default — Tvheadend builds unpatched. CI applies the series
-with `git apply`.
+`series` file. CI applies the series with `git apply`.
+
+Included patches:
+
+- **`010-aribb24-text-encoding.patch`** — adds **ARIB STD-B24** (Japanese ISDB) text
+  decoding via `libaribb24`, exposed as an `ARIB-STD-B24` option in the *Character set*
+  dropdown (network / mux / service). When selected, every SI/EPG string from that tuner is
+  decoded as ARIB STD-B24. Built in via `--enable-aribb24` (needs `libaribb24-dev`).
 
 ## Local patch development
 
