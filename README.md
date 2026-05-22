@@ -69,6 +69,21 @@ Included patches:
   socket. The patch trims the dangling partial character with `utf8_validate_inplace()`.
   Not ARIB-specific — a generic Tvheadend buffer-truncation bug that long multibyte titles
   expose.
+- **`050-isdb-cdt-logo.patch`** — extracts **ISDB station logos** from the CDT (Common Data
+  Table, PID `0x29`) and uses them as channel icons. ISDB broadcasts each broadcaster's logo
+  as a palettised PNG with the `PLTE`/`tRNS` chunks stripped; the patch parses the CDT,
+  rebuilds the PNG from the fixed 129-entry ARIB logo CLUT, writes it under
+  `<config>/isdb_logos/`, and sets it as the icon of every channel of the matching service
+  (matched via the SDT `logo_transmission_descriptor`, tag `0xCF`). Terrestrial logos — BS/CS
+  use a DSM-CC carousel (patch 051). A user-set channel icon is never overwritten.
+- **`051-isdb-dsmcc-logo.patch`** — extracts **BS/CS** station logos, which (unlike
+  terrestrial) ride a **DSM-CC data carousel** rather than the CDT. When a PMT advertises a
+  data ES tagged `component_tag 0x79`/`0x7A` (the ARIB TR-B15 logo carousel), tvheadend opens
+  a DSM-CC handler on it: a DII (`table_id 0x3B`) announces the `LOGO-05`/`CS_LOGO-05` module,
+  DDB sections (`0x3C`) carry it block-by-block, and the reassembled module's per-service
+  logos are reconstructed and applied exactly as for the CDT (patch 050). Implemented to the
+  ARIB TR-B15 spec — it needs a transport that actually carries the carousel (a real ISDB-S
+  tuner, or a full-transponder stream); service-filtered IPTV streams strip it.
 
 ## Local patch development
 

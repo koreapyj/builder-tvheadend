@@ -1,0 +1,278 @@
+--- a/src/input/mpegts/dvb.h
++++ b/src/input/mpegts/dvb.h
+@@ -370,6 +370,12 @@ int dvb_table_begin
+ void dvb_table_reset (mpegts_psi_table_t *mt);
+ void dvb_table_release (mpegts_psi_table_t *mt);
+ 
++#if ENABLE_ARIBB24
++/* ISDB BS/CS logo carousel: open a DSM-CC handler on a carousel ES PID */
++struct mpegts_mux;
++void dvb_dsmcc_install ( struct mpegts_mux *mm, int pid );
++#endif
++
+ /* all-in-one parser */
+ 
+ typedef void (*mpegts_psi_parse_callback_t)
+--- a/src/input/mpegts/dvb_psi.c
++++ b/src/input/mpegts/dvb_psi.c
+@@ -1801,6 +1801,242 @@ dvb_cdt_callback ( mpegts_table_t *mt, c
+ done:
+   return dvb_table_end((mpegts_psi_table_t *)mt, st, sect);
+ }
++
++/* ************************************************************************
++ * ISDB BS/CS station logos via the DSM-CC data carousel (ARIB TR-B15)
++ *
++ * BS/CS logos are not in the CDT; they ride a DSM-CC carousel on a data ES
++ * (stream-identifier descriptor component_tag 0x79 = BS, 0x7A = CS). A DII
++ * (table_id 0x3B) announces modules; a logo module is the one whose name
++ * descriptor is "LOGO-05"/"CS_LOGO-05". DDB sections (0x3C) carry the module
++ * in fixed-size blocks; once reassembled the module is a TsDataModuleLogo
++ * listing per-service logos, each a PNG decoded as for the CDT.
++ *
++ * NOTE: implemented to spec (ARIB TR-B15 / aribts) but only validatable
++ * against a real ISDB-S/transponder feed that actually carries service 929.
++ * ***********************************************************************/
++
++/* Reassembly state for the single in-progress logo module. */
++static struct isdb_dsmcc_state {
++  int       active;
++  uint32_t  download_id;
++  uint16_t  module_id;
++  uint8_t   module_version;
++  uint32_t  module_size;
++  uint32_t  block_size;
++  uint32_t  nblocks;
++  uint8_t  *buf;
++  uint8_t   recv[64];          /* received-block bitmap (up to 512 blocks) */
++} isdb_dsmcc;
++
++static void
++isdb_dsmcc_reset ( void )
++{
++  free(isdb_dsmcc.buf);
++  memset(&isdb_dsmcc, 0, sizeof(isdb_dsmcc));
++}
++
++/* Decode a completed logo module (TsDataModuleLogo) -> per-service logos. */
++static void
++isdb_dsmcc_decode_module ( mpegts_table_t *mt, const uint8_t *b, int len )
++{
++  mpegts_network_t *mn = mt->mt_mux->mm_network;
++  int o, i, j, nloop, nsvc, data_size;
++  uint16_t logo_id;
++  const uint8_t *svc, *png;
++
++  if (len < 3)
++    return;
++  /* logo_type(8) number_of_loop(16) */
++  nloop = (b[1] << 8) | b[2];
++  o = 3;
++  for (i = 0; i < nloop; i++) {
++    if (o + 3 > len)
++      return;
++    logo_id = ((b[o] & 0x01) << 8) | b[o + 1];
++    nsvc    = b[o + 2];
++    o += 3;
++    if (o + nsvc * 6 + 2 > len)
++      return;
++    svc       = b + o;
++    data_size = (b[o + nsvc * 6] << 8) | b[o + nsvc * 6 + 1];
++    png       = b + o + nsvc * 6 + 2;
++    if (o + nsvc * 6 + 2 + data_size > len)
++      return;
++    for (j = 0; j < nsvc; j++) {
++      uint16_t onid = (svc[j*6]   << 8) | svc[j*6+1];
++      uint16_t tsid = (svc[j*6+2] << 8) | svc[j*6+3];
++      uint16_t sid  = (svc[j*6+4] << 8) | svc[j*6+5];
++      mpegts_mux_t *m;
++      if (data_size > 33)
++        isdb_logo_save(onid, logo_id, png, data_size);
++      LIST_FOREACH(m, &mn->mn_muxes, mm_network_link) {
++        mpegts_service_t *s;
++        if (m->mm_onid != onid || m->mm_tsid != tsid)
++          continue;
++        s = mpegts_service_find(m, sid, 0, 0, NULL);
++        if (s) {
++          if (s->s_dvb_logo_id != logo_id) {
++            s->s_dvb_logo_id = logo_id;
++            idnode_changed(&s->s_id);
++          }
++          isdb_logo_apply(s);
++        }
++      }
++    }
++    o += nsvc * 6 + 2 + data_size;
++  }
++}
++
++/* DSM-CC DownloadDataBlock (table_id 0x3C): one carousel block. */
++static void
++isdb_dsmcc_ddb ( mpegts_table_t *mt, const uint8_t *p, int len )
++{
++  uint32_t download_id, off, k;
++  uint16_t module_id, block_no;
++  uint8_t  module_version, adapt;
++  int      msglen, blocklen, pos;
++
++  if (!isdb_dsmcc.active || len < 12)
++    return;
++  download_id = extract_4byte(p + 4);
++  adapt       = p[9];
++  msglen      = (p[10] << 8) | p[11];
++  pos         = 12 + adapt;
++  if (pos + 6 > len)
++    return;
++  module_id      = (p[pos] << 8) | p[pos + 1];
++  module_version = p[pos + 2];
++  block_no       = (p[pos + 4] << 8) | p[pos + 5];
++  blocklen       = msglen - adapt - 6;
++  pos += 6;
++  if (blocklen < 0 || pos + blocklen > len)
++    return;
++  if (download_id != isdb_dsmcc.download_id ||
++      module_id != isdb_dsmcc.module_id ||
++      module_version != isdb_dsmcc.module_version ||
++      block_no >= isdb_dsmcc.nblocks)
++    return;
++  off = block_no * isdb_dsmcc.block_size;
++  if (off >= isdb_dsmcc.module_size)
++    return;
++  if (off + blocklen > isdb_dsmcc.module_size)
++    blocklen = isdb_dsmcc.module_size - off;
++  memcpy(isdb_dsmcc.buf + off, p + pos, blocklen);
++  isdb_dsmcc.recv[block_no >> 3] |= 1 << (block_no & 7);
++  for (k = 0; k < isdb_dsmcc.nblocks; k++)
++    if (!(isdb_dsmcc.recv[k >> 3] & (1 << (k & 7))))
++      return;                          /* still incomplete */
++  tvhinfo(LS_TBL_BASE, "isdb: dsmcc logo module %u complete (%u bytes)",
++          isdb_dsmcc.module_id, isdb_dsmcc.module_size);
++  isdb_dsmcc_decode_module(mt, isdb_dsmcc.buf, isdb_dsmcc.module_size);
++  isdb_dsmcc_reset();
++}
++
++/* DSM-CC DownloadInfoIndication (table_id 0x3B): module announcement. */
++static void
++isdb_dsmcc_dii ( const uint8_t *p, int len )
++{
++  uint32_t download_id, module_size;
++  uint16_t block_size, nmod, module_id;
++  uint8_t  adapt, module_version, info_len;
++  int      pos, i, cdlen, d, dend, is_logo;
++
++  if (len < 12)
++    return;
++  adapt = p[9];
++  pos   = 12 + adapt;
++  if (pos + 18 > len)
++    return;
++  download_id = extract_4byte(p + pos);
++  block_size  = (p[pos + 4] << 8) | p[pos + 5];
++  pos += 16;                            /* downloadId..tCDownloadScenario */
++  cdlen = (p[pos] << 8) | p[pos + 1];   /* compatibilityDescriptor */
++  pos  += 2 + cdlen;
++  if (pos + 2 > len || block_size == 0)
++    return;
++  nmod = (p[pos] << 8) | p[pos + 1];
++  pos += 2;
++  for (i = 0; i < nmod; i++) {
++    if (pos + 8 > len)
++      return;
++    module_id      = (p[pos] << 8) | p[pos + 1];
++    module_size    = extract_4byte(p + pos + 2);
++    module_version = p[pos + 6];
++    info_len       = p[pos + 7];
++    pos += 8;
++    if (pos + info_len > len)
++      return;
++    is_logo = 0;
++    d = pos; dend = pos + info_len;
++    while (d + 2 <= dend) {
++      uint8_t dl = p[d + 1];
++      if (d + 2 + dl > dend)
++        break;
++      if (p[d] == 0x02 &&     /* module name descriptor */
++          ((dl == 7  && !memcmp(p + d + 2, "LOGO-05", 7)) ||
++           (dl == 10 && !memcmp(p + d + 2, "CS_LOGO-05", 10))))
++        is_logo = 1;
++      d += 2 + dl;
++    }
++    pos += info_len;
++    if (!is_logo)
++      continue;
++    if (isdb_dsmcc.active &&
++        isdb_dsmcc.download_id == download_id &&
++        isdb_dsmcc.module_id == module_id &&
++        isdb_dsmcc.module_version == module_version)
++      return;                           /* already collecting this version */
++    if (module_size == 0 || module_size > 4*1024*1024)
++      return;
++    isdb_dsmcc_reset();
++    if ((module_size + block_size - 1) / block_size > 512)
++      return;                           /* exceeds the block bitmap */
++    isdb_dsmcc.buf = calloc(1, module_size);
++    if (isdb_dsmcc.buf == NULL)
++      return;
++    isdb_dsmcc.active         = 1;
++    isdb_dsmcc.download_id    = download_id;
++    isdb_dsmcc.module_id      = module_id;
++    isdb_dsmcc.module_version = module_version;
++    isdb_dsmcc.module_size    = module_size;
++    isdb_dsmcc.block_size     = block_size;
++    isdb_dsmcc.nblocks        = (module_size + block_size - 1) / block_size;
++    tvhinfo(LS_TBL_BASE, "isdb: dsmcc logo module %u announced "
++            "(%u bytes, %u blocks)", module_id, module_size,
++            isdb_dsmcc.nblocks);
++    return;
++  }
++}
++
++/* DSM-CC section handler for a logo carousel ES (table_id 0x3B / 0x3C). */
++static int
++dvb_dsmcc_callback ( mpegts_table_t *mt, const uint8_t *ptr, int len, int tableid )
++{
++  int total, paylen;
++
++  if ((tableid != 0x3B && tableid != 0x3C) || len < 12)
++    return 0;
++  total = (((ptr[1] & 0x0f) << 8) | ptr[2]) + 3;
++  if (total > len || total < 16)
++    return 0;
++  paylen = total - 8 - 4;               /* drop 8-byte header and CRC */
++  if (paylen >= 12) {
++    if (tableid == 0x3B)
++      isdb_dsmcc_dii(ptr + 8, paylen);
++    else
++      isdb_dsmcc_ddb(mt, ptr + 8, paylen);
++  }
++  return 0;
++}
++
++/* Open a DSM-CC carousel handler on a logo-carousel ES (called from PMT). */
++void
++dvb_dsmcc_install ( mpegts_mux_t *mm, int pid )
++{
++  mpegts_table_add(mm, 0x3B, 0xF8, dvb_dsmcc_callback, NULL,
++                   "dsmcc", LS_TBL_BASE, 0, pid, MPS_WEIGHT_TDT);
++}
+ #endif /* ENABLE_ARIBB24 */
+ 
+ /**
+--- a/src/input/mpegts/dvb_psi_pmt.c
++++ b/src/input/mpegts/dvb_psi_pmt.c
+@@ -470,6 +470,15 @@ dvb_psi_parse_pmt
+           hts_stream_type = SCT_ARIBSUB;
+         break;
+ 
++#if ENABLE_ARIBB24
++      case DVB_DESC_STREAM_ID:
++        /* ISDB BS/CS logo carousel: an ES tagged component_tag 0x79 (BS) or
++         * 0x7A (CS) carries the DSM-CC data carousel - open a handler. */
++        if(dlen >= 1 && (ptr[0] == 0x79 || ptr[0] == 0x7A))
++          dvb_dsmcc_install(mt->mt_mux, pid);
++        break;
++#endif
++
+       default:
+         break;
+       }

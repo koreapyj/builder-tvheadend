@@ -1,0 +1,302 @@
+--- a/src/input/mpegts.h
++++ b/src/input/mpegts.h
+@@ -578,6 +578,7 @@ struct mpegts_service
+   char    *s_dvb_provider;
+   char    *s_dvb_cridauth;
+   uint16_t s_dvb_servicetype;
++  uint16_t s_dvb_logo_id;
+   int      s_dvb_ignore_eit;
+   int      s_dvb_subtitle_processing;       //Various options for replacing/augmenting the desc from the sub-title
+   int      s_dvb_ignore_matching_subtitle;  //Ignore the sub-title if same as title
+--- a/src/input/mpegts/dvb.h
++++ b/src/input/mpegts/dvb.h
+@@ -48,6 +48,7 @@ struct lang_str;
+ #define DVB_TDT_PID                   0x14
+ #define DVB_SNC_PID                   0x15
+ #define DVB_RNT_PID                   0x16
++#define DVB_CDT_PID                   0x29
+ #define DVB_INB_PID                   0x1C
+ #define DVB_MSR_PID                   0x1D
+ #define DVB_DIT_PID                   0x1E
+@@ -76,6 +77,9 @@ struct lang_str;
+ #define DVB_BAT_BASE                  0x48
+ #define DVB_BAT_MASK                  0xF8
+ 
++#define DVB_CDT_BASE                  0xC8
++#define DVB_CDT_MASK                  0xFF
++
+ #define DVB_TDT_BASE                  0x70
+ #define DVB_TDT_MASK                  0xFF
+ 
+@@ -178,6 +182,7 @@ struct lang_str;
+ #define DVB_DESC_FREESAT_REGIONS      0xD4
+ 
+ /* ARIB STD-B10 (ISDB) */
++#define DVB_DESC_LOGO_TRANSMISSION    0xCF
+ #define DVB_DESC_ARIB_SERIES          0xD5
+ #define DVB_DESC_ARIB_EVENT_GROUP     0xD6
+ #define DVB_DESC_DATA_COMPONENT       0xFD
+--- a/src/input/mpegts/dvb_psi.c
++++ b/src/input/mpegts/dvb_psi.c
+@@ -23,6 +23,8 @@
+ #include "tsdemux.h"
+ #include "lang_codes.h"
+ #include "service.h"
++#include "channels.h"
++#include "settings.h"
+ #include "dvb_charset.h"
+ #include "bouquet.h"
+ #include "fastscan.h"
+@@ -1611,6 +1613,196 @@ dvberr:
+   return -1;
+ }
+ 
++#if ENABLE_ARIBB24
++/* ************************************************************************
++ * ISDB station logo extraction (ARIB STD-B21 CDT / STD-B24 logo)
++ * ***********************************************************************/
++
++/*
++ * An ISDB logo is a palettised PNG transmitted with its PLTE and tRNS
++ * chunks removed: only the 8-byte signature + 25-byte IHDR, then IDAT/IEND.
++ * These two chunks, rebuilt from the fixed 129-entry ARIB logo CLUT and
++ * inserted after byte 33, complete the PNG. They are constant (length +
++ * tag + data + CRC-32), generated from node-aribts src/logo_clut.ts.
++ */
++static const uint8_t isdb_logo_plte[399] = {
++  0x00, 0x00, 0x01, 0x83, 0x50, 0x4c, 0x54, 0x45, 0x00, 0x00, 0x00, 0xff,
++  0x00, 0x00, 0x00, 0xff, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff,
++  0x00, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0xaa,
++  0x00, 0x00, 0x00, 0xaa, 0x00, 0xaa, 0xaa, 0x00, 0x00, 0x00, 0xaa, 0xaa,
++  0x00, 0xaa, 0x00, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x00, 0x00, 0x55, 0x00,
++  0x55, 0x00, 0x00, 0x55, 0x55, 0x00, 0x55, 0xaa, 0x00, 0x55, 0xff, 0x00,
++  0xaa, 0x55, 0x00, 0xaa, 0xff, 0x00, 0xff, 0x55, 0x00, 0xff, 0xaa, 0x55,
++  0x00, 0x00, 0x55, 0x00, 0x55, 0x55, 0x00, 0xaa, 0x55, 0x00, 0xff, 0x55,
++  0x55, 0x00, 0x55, 0x55, 0x55, 0x55, 0x55, 0xaa, 0x55, 0x55, 0xff, 0x55,
++  0xaa, 0x00, 0x55, 0xaa, 0x55, 0x55, 0xaa, 0xaa, 0x55, 0xaa, 0xff, 0x55,
++  0xff, 0x00, 0x55, 0xff, 0x55, 0x55, 0xff, 0xaa, 0x55, 0xff, 0xff, 0xaa,
++  0x00, 0x55, 0xaa, 0x00, 0xff, 0xaa, 0x55, 0x00, 0xaa, 0x55, 0x55, 0xaa,
++  0x55, 0xaa, 0xaa, 0x55, 0xff, 0xaa, 0xaa, 0x55, 0xaa, 0xaa, 0xff, 0xaa,
++  0xff, 0x00, 0xaa, 0xff, 0x55, 0xaa, 0xff, 0xaa, 0xaa, 0xff, 0xff, 0xff,
++  0x00, 0x55, 0xff, 0x00, 0xff, 0xff, 0x55, 0x00, 0xff, 0x55, 0x55, 0xff,
++  0x55, 0xaa, 0xff, 0x55, 0xff, 0xff, 0xaa, 0x00, 0xff, 0xaa, 0x55, 0xff,
++  0xaa, 0xaa, 0xff, 0xaa, 0xff, 0xff, 0xff, 0x55, 0xff, 0xff, 0xff, 0x00,
++  0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0xff, 0x00, 0xff, 0xff, 0x00, 0x00,
++  0x00, 0xff, 0xff, 0x00, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xaa,
++  0x00, 0x00, 0x00, 0xaa, 0x00, 0xaa, 0xaa, 0x00, 0x00, 0x00, 0xaa, 0xaa,
++  0x00, 0xaa, 0x00, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x00, 0x00, 0x55, 0x00,
++  0x55, 0x00, 0x00, 0x55, 0x55, 0x00, 0x55, 0xaa, 0x00, 0x55, 0xff, 0x00,
++  0xaa, 0x55, 0x00, 0xaa, 0xff, 0x00, 0xff, 0x55, 0x00, 0xff, 0xaa, 0x55,
++  0x00, 0x00, 0x55, 0x00, 0x55, 0x55, 0x00, 0xaa, 0x55, 0x00, 0xff, 0x55,
++  0x55, 0x00, 0x55, 0x55, 0x55, 0x55, 0x55, 0xaa, 0x55, 0x55, 0xff, 0x55,
++  0xaa, 0x00, 0x55, 0xaa, 0x55, 0x55, 0xaa, 0xaa, 0x55, 0xaa, 0xff, 0x55,
++  0xff, 0x00, 0x55, 0xff, 0x55, 0x55, 0xff, 0xaa, 0x55, 0xff, 0xff, 0xaa,
++  0x00, 0x55, 0xaa, 0x00, 0xff, 0xaa, 0x55, 0x00, 0xaa, 0x55, 0x55, 0xaa,
++  0x55, 0xaa, 0xaa, 0x55, 0xff, 0xaa, 0xaa, 0x55, 0xaa, 0xaa, 0xff, 0xaa,
++  0xff, 0x00, 0xaa, 0xff, 0x55, 0xaa, 0xff, 0xaa, 0xaa, 0xff, 0xff, 0xff,
++  0x00, 0x55, 0xff, 0x00, 0xff, 0xff, 0x55, 0x00, 0xff, 0x55, 0x55, 0xff,
++  0x55, 0xaa, 0xff, 0x55, 0xff, 0xff, 0xaa, 0x00, 0xff, 0xaa, 0x55, 0xff,
++  0xaa, 0xaa, 0xff, 0xaa, 0xff, 0xff, 0xff, 0x55, 0xff, 0xff, 0xff, 0x06,
++  0xdd, 0x27, 0x7b,
++};
++
++static const uint8_t isdb_logo_trns[141] = {
++  0x00, 0x00, 0x00, 0x81, 0x74, 0x52, 0x4e, 0x53, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
++  0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
++  0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
++  0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
++  0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
++  0x80, 0x80, 0x80, 0x80, 0x80, 0x7b, 0x70, 0xf7, 0x6f,
++};
++
++/* Absolute path of the logo PNG file for (onid, logo_id). */
++static int
++isdb_logo_filename ( char *dst, size_t dstlen, uint16_t onid, uint16_t logo_id )
++{
++  return hts_settings_buildpath(dst, dstlen, "isdb_logos/%u_%u.png",
++                                onid, logo_id);
++}
++
++/* Reconstruct the PNG (header + PLTE + tRNS + IDAT/IEND) and write it. */
++static void
++isdb_logo_save ( uint16_t onid, uint16_t logo_id, const uint8_t *data, int len )
++{
++  char path[PATH_MAX];
++  FILE *fp;
++
++  if (len < 33)
++    return;
++  if (isdb_logo_filename(path, sizeof(path), onid, logo_id))
++    return;
++  hts_settings_makedirs(path);
++  if ((fp = fopen(path, "wb")) == NULL)
++    return;
++  fwrite(data, 1, 33, fp);
++  fwrite(isdb_logo_plte, 1, sizeof(isdb_logo_plte), fp);
++  fwrite(isdb_logo_trns, 1, sizeof(isdb_logo_trns), fp);
++  fwrite(data + 33, 1, len - 33, fp);
++  fclose(fp);
++  tvhinfo(LS_TBL_BASE, "isdb: logo onid %04X id %u saved (%s)",
++          onid, logo_id, path);
++}
++
++/*
++ * If the logo file for this service exists, set it as the icon of any of
++ * the service's channels that has no icon. A user-set icon is never
++ * overwritten.
++ */
++static void
++isdb_logo_apply ( mpegts_service_t *s )
++{
++  char path[PATH_MAX], url[PATH_MAX + 8];
++  idnode_list_mapping_t *ilm;
++  channel_t *ch;
++
++  if (s == NULL || s->s_dvb_logo_id == 0 || s->s_dvb_mux == NULL)
++    return;
++  if (isdb_logo_filename(path, sizeof(path),
++                         s->s_dvb_mux->mm_onid, s->s_dvb_logo_id))
++    return;
++  if (access(path, R_OK))
++    return;  /* logo not extracted yet */
++  snprintf(url, sizeof(url), "file://%s", path);
++  LIST_FOREACH(ilm, &s->s_channels, ilm_in1_link) {
++    ch = (channel_t *)ilm->ilm_in2;
++    if (ch->ch_icon && ch->ch_icon[0])
++      continue;
++    if (channel_set_icon(ch, url))
++      idnode_changed(&ch->ch_id);
++  }
++}
++
++/* Apply a freshly-saved logo to every matching service on the network. */
++static void
++isdb_logo_apply_network ( mpegts_mux_t *mm, uint16_t onid, uint16_t logo_id )
++{
++  mpegts_mux_t *m;
++  mpegts_service_t *s;
++
++  LIST_FOREACH(m, &mm->mm_network->mn_muxes, mm_network_link) {
++    if (m->mm_onid != onid)
++      continue;
++    LIST_FOREACH(s, &m->mm_services, s_dvb_mux_link)
++      if (s->s_dvb_logo_id == logo_id)
++        isdb_logo_apply(s);
++  }
++}
++
++/*
++ * CDT (Common Data Table) - PID 0x29, table_id 0xC8.
++ *
++ * Carries ISDB station logos. Each section holds one self-contained logo
++ * data module of a distinct logo_type; only logo_type 0x05 (the standard
++ * receiver logo) is kept.
++ */
++static int
++dvb_cdt_callback ( mpegts_table_t *mt, const uint8_t *ptr, int len, int tableid )
++{
++  int r, sect, last, ver, seclen, total, dll, dmlen, data_size;
++  uint16_t download_data_id, onid, logo_id;
++  const uint8_t *dm;
++  mpegts_psi_table_state_t *st = NULL;
++
++  if (tableid != DVB_CDT_BASE || len < 24)
++    return -1;
++  download_data_id = extract_2byte(ptr + 3);
++  r = dvb_table_begin((mpegts_psi_table_t *)mt, ptr, len, tableid,
++                      download_data_id, 13, &st, &sect, &last, &ver, 0);
++  if (r != 1)
++    return r;
++
++  seclen = ((ptr[1] & 0x0f) << 8) | ptr[2];
++  total  = seclen + 3;
++  if (total > len || total < 24)
++    goto done;
++
++  onid = extract_2byte(ptr + 8);
++  dll  = ((ptr[11] & 0x0f) << 8) | ptr[12];
++  if (ptr[10] != 0x01 || 13 + dll + 7 + 4 > total)   /* data_type 0x01 = logo */
++    goto done;
++
++  dm    = ptr + 13 + dll;
++  dmlen = total - 4 - (13 + dll);
++
++  /* logo data module: logo_type(8) res(7) logo_id(9) res(4) logo_version(12)
++   *                    data_size(16) data_byte[] */
++  logo_id   = ((dm[1] & 0x01) << 8) | dm[2];
++  data_size = extract_2byte(dm + 5);
++  if (dm[0] == 0x05 && data_size > 33 && 7 + data_size <= dmlen) {
++    isdb_logo_save(onid, logo_id, dm + 7, data_size);
++    isdb_logo_apply_network(mt->mt_mux, onid, logo_id);
++  }
++
++done:
++  return dvb_table_end((mpegts_psi_table_t *)mt, st, sect);
++}
++#endif /* ENABLE_ARIBB24 */
++
+ /**
+  * DVB SDT (Service Description Table)
+  */
+@@ -1634,6 +1826,9 @@ dvb_sdt_mux
+     uint16_t service_id                = extract_svcid(ptr);
+     int      free_ca_mode              = (ptr[3] >> 4) & 0x1;
+     int      stype = 0;
++#if ENABLE_ARIBB24
++    int      logo_id = 0;
++#endif
+     char     sprov[256], sname[256], sauth[256];
+     int      running_status            = (ptr[3] >> 5) & 0x7;
+     const char *charset;
+@@ -1676,6 +1871,13 @@ dvb_sdt_mux
+             if (dvb_get_string(sname, sizeof(sname), dptr, dlen, charset, NULL))
+               tvhtrace(mt->mt_subsys, "%s:      bskyb nvod error", mt->mt_name);
+           break;
++#if ENABLE_ARIBB24
++        case DVB_DESC_LOGO_TRANSMISSION:
++          /* ISDB logo link: type 1/2 carry a 9-bit logo_id */
++          if (dlen >= 3 && (dptr[0] == 0x01 || dptr[0] == 0x02))
++            logo_id = ((dptr[1] & 0x01) << 8) | dptr[2];
++          break;
++#endif
+       }
+     }}
+ 
+@@ -1695,8 +1897,18 @@ dvb_sdt_mux
+       if ((r = dvb_servicetype_lookup(stype)) != -1)
+         s->s_servicetype = r;
+     }
+-    
+-    /* Check if this is master 
++
++#if ENABLE_ARIBB24
++    /* ISDB logo (logo_transmission_descriptor, tag 0xCF) */
++    if (logo_id && s->s_dvb_logo_id != logo_id) {
++      s->s_dvb_logo_id = logo_id;
++      save = 1;
++    }
++    if (s->s_dvb_logo_id)
++      isdb_logo_apply(s);
++#endif
++
++    /* Check if this is master
+      * Some networks appear to provide diff service names on diff transponders
+      */
+     if (tableid == 0x42 || mm == mm_orig)
+@@ -2263,6 +2475,10 @@ psi_tables_dvb ( mpegts_mux_t *mm )
+                    DVB_SDT_PID, MPS_WEIGHT_SDT);
+   mpegts_table_add(mm, DVB_BAT_BASE, DVB_BAT_MASK, dvb_bat_callback,
+                    NULL, "bat", LS_TBL_BASE, MT_CRC, DVB_BAT_PID, MPS_WEIGHT_BAT);
++#if ENABLE_ARIBB24
++  mpegts_table_add(mm, DVB_CDT_BASE, DVB_CDT_MASK, dvb_cdt_callback,
++                   NULL, "cdt", LS_TBL_BASE, MT_CRC, DVB_CDT_PID, MPS_WEIGHT_TDT);
++#endif
+   if (config.tvhtime_update_enabled) {
+     mpegts_table_add(mm, DVB_TDT_BASE, DVB_TDT_MASK, dvb_tdt_callback,
+                      NULL, "tdt", LS_TBL_TIME, MT_ONESHOT | MT_QUICKREQ | MT_RECORD,

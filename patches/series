@@ -2,3 +2,5 @@
 020-aribb24-subtitle.patch
 030-aribb24-epg.patch
 040-dvr-subscription-title-utf8.patch
+050-isdb-cdt-logo.patch
+051-isdb-dsmcc-logo.patch
