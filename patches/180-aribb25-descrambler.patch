@@ -43,7 +43,7 @@
  #
 --- /dev/null
 +++ b/src/descrambler/aribb25.c
-@@ -0,0 +1,500 @@
+@@ -0,0 +1,549 @@
 +/*
 + *  Tvheadend - ARIB STD-B25 descrambler via libaribb25
 + *
@@ -89,7 +89,9 @@
 +
 +struct aribb25_descrambler {
 +  th_descrambler_t;
-+  aribb25_mux_t *ad_mux_state;
++  aribb25_mux_t   *ad_mux_state;
++  mpegts_mux_t    *ad_mux;        /* needed for descrambler_close_pid on destroy */
++  mpegts_apids_t   ad_ecm_pids;   /* ECM PIDs we opened with descrambler_open_pid */
 +};
 +
 +/*
@@ -298,11 +300,30 @@
 + * not enough for ARIB ISDB activation.
 + * ***********************************************************************/
 +
++/*
++ * No-op ECM section callback. libaribb25 parses ECMs from the raw TS itself;
++ * we only need descrambler_open_pid to subscribe the ECM PIDs so the demux
++ * actually delivers those packets into the mux's TS stream.
++ */
++static void
++aribb25_ecm_section_cb
++  ( void *opaque, int pid, const uint8_t *data, int len, int emm )
++{
++}
++
 +static void
 +aribb25_service_destroy ( th_descrambler_t *td )
 +{
 +  aribb25_descrambler_t *ad = (aribb25_descrambler_t *)td;
 +  aribb25_mux_t         *am = ad->ad_mux_state;
++  int                    i;
++
++  if (ad->ad_mux) {
++    for (i = 0; i < ad->ad_ecm_pids.count; i++)
++      descrambler_close_pid(ad->ad_mux, ad,
++                            DESCRAMBLER_ECM_PID(ad->ad_ecm_pids.pids[i].pid));
++  }
++  mpegts_pid_done(&ad->ad_ecm_pids);
 +
 +  if (am) {
 +    aribb25_t *ab = am->am_owner;
@@ -382,10 +403,22 @@
 +
 +  ad = calloc(1, sizeof(*ad));
 +  ad->ad_mux_state = am;
++  ad->ad_mux       = mux;
++  mpegts_pid_init(&ad->ad_ecm_pids);
 +  td               = (th_descrambler_t *)ad;
 +  td->td_nicename  = strdup("aribb25");
 +  td->td_service   = t;
 +  td->td_stop      = aribb25_service_destroy;
++
++  /* Collect every ES with a matching CAID; its es_pid IS the ECM PID. */
++  TAILQ_FOREACH(st, &t->s_components.set_all, es_link) {
++    if (st->es_type != SCT_CA) continue;
++    LIST_FOREACH(c, &st->es_caids, link)
++      if (c->use && c->caid == ARIBB25_BCAS_CAID) {
++        mpegts_pid_add(&ad->ad_ecm_pids, st->es_pid, 0);
++        break;
++      }
++  }
 +
 +  dr = ms->s_descramble;
 +  if (dr) {
@@ -397,7 +430,23 @@
 +
 +  tvh_mutex_unlock(&t->s_stream_mutex);
 +
-+  tvhinfo(LS_ARIBB25, "service %p: descrambler attached (mux=%p)", t, mux);
++  /*
++   * Subscribe the ECM PIDs on the mux so the DMX delivers them. Without this
++   * libaribb25 sees PAT+PMT+scrambled-ES but never an ECM, so its put() keeps
++   * returning WARN_ECM_NOT_COMPLETE; we'd emit no descrambled output until it
++   * eventually fails hard after buffering 32MB of input -- well past
++   * tvheadend's 20-second subscription start-up timeout.
++   */
++  {
++    int i;
++    for (i = 0; i < ad->ad_ecm_pids.count; i++)
++      descrambler_open_pid(mux, ad,
++                           DESCRAMBLER_ECM_PID(ad->ad_ecm_pids.pids[i].pid),
++                           aribb25_ecm_section_cb, t);
++  }
++
++  tvhinfo(LS_ARIBB25, "service %p: descrambler attached (mux=%p, ecms=%d)",
++          t, mux, ad->ad_ecm_pids.count);
 +}
 +
 +static void
@@ -622,20 +671,20 @@
        for (tmp = mp->mp_data, end = mp->mp_data + len2; tmp < end; tmp += 188)
 --- a/src/tvhlog.c
 +++ b/src/tvhlog.c
-@@ -170,6 +170,7 @@ tvhlog_subsys_t tvhlog_subsystems[] = {
+@@ -169,6 +169,7 @@ tvhlog_subsys_t tvhlog_subsystems[] = {
+   [LS_SATIP]         = { "satip",         N_("SAT>IP Client") },
    [LS_SATIPS]        = { "satips",        N_("SAT>IP Server") },
    [LS_TVHDHOMERUN]   = { "tvhdhomerun",   N_("TVHDHomeRun Client") },
-   [LS_PX4]           = { "px4",           N_("px4_drv") },
 +  [LS_ARIBB25]       = { "aribb25",       N_("ARIB STD-B25 descrambler") },
    [LS_PSIP]          = { "psip",          N_("ATSC PSIP EPG") },
    [LS_OPENTV]        = { "opentv",        N_("OpenTV EPG") },
    [LS_PYEPG]         = { "pyepg",         N_("PyEPG Import") },
 --- a/src/tvhlog.h
 +++ b/src/tvhlog.h
-@@ -189,6 +189,7 @@ enum {
+@@ -188,6 +188,7 @@ enum {
+   LS_SATIP,
    LS_SATIPS,
    LS_TVHDHOMERUN,
-   LS_PX4,
 +  LS_ARIBB25,
    LS_PSIP,
    LS_OPENTV,

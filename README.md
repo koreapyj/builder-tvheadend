@@ -41,7 +41,7 @@ is no `series` file — CI applies the patches with `git apply` in `ls | sort` o
 numeric `NNN` prefix *is* the apply order.
 
 Included patches — the **`00x`** range is generic upstream bug fixes; **`1xx`** is the
-ARIB / ISDB feature patches:
+ARIB / ISDB feature patches; **`5xx`** is reserved for additional device / tuner support:
 
 - **`001-dvr-subscription-title-utf8.patch`** — fixes the web UI websocket dying once a
   recording exists. Tvheadend builds the recording's subscription title with
