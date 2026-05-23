@@ -71,9 +71,10 @@ jobs:
                 wget bzip2 ca-certificates python3 python3-requests \
                 zlib1g-dev libssl-dev liburiparser-dev libdvbcsa-dev libavahi-client-dev libpcre2-dev \
                 libavdevice-dev libdbus-1-dev libhdhomerun-dev libopus-dev libva-dev libvpx-dev \
-                libx264-dev libx265-dev libaribb24-dev pngquant
+                libx264-dev libx265-dev libaribb24-dev libpcsclite-dev pngquant
+              PREFIX=/usr bash /ws/support/build-libaribb25.sh
               git config --global --add safe.directory "*"
-              export AUTOBUILD_CONFIGURE_EXTRA="--disable-ffmpeg_static --disable-hdhomerun_static --disable-libfdkaac_static --disable-libmfx_static --disable-libopus_static --disable-libtheora_static --disable-libvorbis_static --disable-libvpx_static --disable-libx264_static --disable-libx265_static --enable-hdhomerun_client --enable-libav --enable-aribb24 --python=python3"
+              export AUTOBUILD_CONFIGURE_EXTRA="--disable-ffmpeg_static --disable-hdhomerun_static --disable-libfdkaac_static --disable-libmfx_static --disable-libopus_static --disable-libtheora_static --disable-libvorbis_static --disable-libvpx_static --disable-libx264_static --disable-libx265_static --enable-hdhomerun_client --enable-libav --enable-aribb24 --enable-aribb25 --python=python3"
               ./Autobuild.sh -j"$(nproc)"
             '
 

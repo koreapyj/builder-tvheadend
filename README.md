@@ -104,6 +104,22 @@ ARIB / ISDB feature patches:
   offset, per ARIB TR-B14), giving the familiar Japanese "X.Y" channel display (e.g. 4.1 for
   NTV primary, 4.2 for the sub-service). Without this, every ISDB service scanned by
   tvheadend shows channel number 0.0.
+- **`180-aribb25-descrambler.patch`** — adds ARIB STD-B25 (MULTI2) descrambling as a new
+  tvheadend CA client backed by [libaribb25](https://github.com/koreapyj/libaribb25). Unlike
+  tvheadend's other CA clients (CWC / CCcam / capmt) which supply control words to
+  tvhcsa, libaribb25 owns the whole pipeline — it parses PMT/ECM, talks to a B-CAS card,
+  and emits descrambled TS — so the client attaches itself per-mux as a new
+  `mm_filter_packets` hook run early in `mpegts_input_recv_packets`. The B-CAS card
+  backend is a user option: **CobaltCas** (a software Blue Card emulator, linked in by
+  building libaribb25 with `-DUSE_COBALTCAS=ON`) or **PC/SC** (a physical card via
+  `libpcsclite`). `process_emm` is exposed as a separate option — leave off for
+  CobaltCas (Blue Card has no entitlements to update), turn on for a physical Red Card
+  so pay-channel entitlements keep refreshing. CobaltCas card-image path is
+  configurable. Activates automatically on services with CAID `0x0005`. libaribb25 is
+  built and installed by the CI / `make build` workflow via `support/build-libaribb25.sh`
+  (the libaribb25 fork's stock cobalt cpp is a Linux-buildable but missing user-facing
+  setters for the card image path / log; the script injects three small `extern "C"`
+  setters before cmake-installing the static `libaribb25.a`).
 
 ## Local patch development
 

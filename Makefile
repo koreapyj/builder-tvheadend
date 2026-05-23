@@ -14,7 +14,7 @@ QUILTRC := $(CURDIR)/.quiltrc
 # transcoding or Debian packaging.
 BUILD_DEPS := build-essential cmake git pkg-config gettext libavahi-client-dev \
               libssl-dev zlib1g-dev liburiparser-dev libpcre2-dev libdvbcsa-dev \
-              libaribb24-dev python3 wget bzip2 ca-certificates
+              libaribb24-dev libpcsclite-dev python3 wget bzip2 ca-certificates
 
 # Minimal configure flags — fast, offline, no transcoding / DVB-scan fetch.
 # --prefix=/usr puts TVHEADEND_DATADIR at /usr/share/tvheadend, matching the
@@ -28,7 +28,7 @@ BUILD_CONFIGURE := --prefix=/usr \
 # Runtime shared libraries needed to *run* the test binary. The -dev package
 # names are stable across releases and pull in the correct SONAME packages.
 RUN_DEPS := libavahi-client-dev libssl-dev zlib1g-dev liburiparser-dev \
-            libpcre2-dev libdvbcsa-dev libaribb24-dev
+            libpcre2-dev libdvbcsa-dev libaribb24-dev libpcsclite1
 
 .DEFAULT_GOAL := help
 .PHONY: help prepare build run update refresh clean
@@ -78,7 +78,7 @@ build:
 	@test -d $(SRC) || { echo "No $(SRC)/ — run 'make prepare' (or 'make prepare QUILT=1') first"; exit 1; }
 	docker run --rm -e DEBIAN_FRONTEND=noninteractive \
 		-v "$(CURDIR):/ws" -w /ws/$(SRC) "$(BUILD_IMAGE)" \
-		bash -euxc 'apt-get update -y && apt-get install -y $(BUILD_DEPS) && git config --global --add safe.directory "*" && ./configure $(BUILD_CONFIGURE) && make -j"$$(nproc)" && chown -R "$$(stat -c %u:%g /ws)" .'
+		bash -euxc 'apt-get update -y && apt-get install -y $(BUILD_DEPS) && PREFIX=/usr bash /ws/support/build-libaribb25.sh && git config --global --add safe.directory "*" && ./configure $(BUILD_CONFIGURE) && make -j"$$(nproc)" && chown -R "$$(stat -c %u:%g /ws)" .'
 	@echo
 	@echo 'Built: $(SRC)/build.linux/tvheadend'
 

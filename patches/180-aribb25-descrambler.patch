@@ -1,0 +1,655 @@
+--- a/Makefile
++++ b/Makefile
+@@ -612,6 +612,12 @@ SRCS-CONSTCW = \
+ SRCS-${CONFIG_CONSTCW} += $(SRCS-CONSTCW)
+ I18N-C += $(SRCS-CONSTCW)
+ 
++# ARIB STD-B25 (Japanese ISDB descrambler via libaribb25)
++SRCS-ARIBB25 = \
++	src/descrambler/aribb25.c
++SRCS-${CONFIG_ARIBB25} += $(SRCS-ARIBB25)
++I18N-C += $(SRCS-ARIBB25)
++
+ # DVB CAM
+ SRCS-DVBCAM = \
+         src/input/mpegts/en50221/en50221.c \
+--- a/configure
++++ b/configure
+@@ -64,6 +64,7 @@ OPTIONS=(
+   "pcre2:auto"
+   "uriparser:auto"
+   "aribb24:auto"
++  "aribb25:auto"
+   "ccache:auto"
+   "tvhcsa:auto"
+   "bundle:no"
+@@ -566,6 +567,17 @@ if enabled_or_auto aribb24; then
+   fi
+ fi
+ 
++#
++# aribb25 (ARIB STD-B25 descrambler for ISDB; uses libpcsclite or CobaltCas)
++#
++if enabled_or_auto aribb25; then
++  if check_pkg libaribb25; then
++    enable aribb25
++  elif enabled aribb25; then
++    die "libaribb25 development support not found (use --disable-aribb25)"
++  fi
++fi
++
+ #
+ # Bundling
+ #
+--- /dev/null
++++ b/src/descrambler/aribb25.c
+@@ -0,0 +1,500 @@
++/*
++ *  Tvheadend - ARIB STD-B25 descrambler via libaribb25
++ *
++ *  Wraps libaribb25 as a CA client. libaribb25 is monolithic - it eats whole
++ *  TS, parses ECM/PMT internally, talks to a B-CAS card (physical via PC/SC,
++ *  or software-emulated via CobaltCas), and emits descrambled TS. So instead
++ *  of supplying control words to tvheadend's tvhcsa, the CA client owns a
++ *  per-mux libaribb25 instance and registers itself as the mux's
++ *  `mm_filter_packets` hook, which runs early in mpegts_input_recv_packets.
++ *
++ *  This program is free software: you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation, either version 3 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ */
++
++#include "tvheadend.h"
++#include "settings.h"
++#include "caclient.h"
++#include "service.h"
++#include "input.h"
++#include "sbuf.h"
++#include "descrambler/descrambler.h"
++#include "descrambler/caid.h"
++
++#include <aribb25/arib_std_b25.h>
++#include <aribb25/b_cas_card.h>
++#include <aribb25/b_cas_cobalt.h>
++
++#define ARIBB25_BCAS_CAID         0x0005
++
++#define ARIBB25_BACKEND_COBALT    0
++#define ARIBB25_BACKEND_PCSC      1
++
++typedef struct aribb25             aribb25_t;
++typedef struct aribb25_mux         aribb25_mux_t;
++typedef struct aribb25_descrambler aribb25_descrambler_t;
++
++struct aribb25_descrambler {
++  th_descrambler_t;
++  aribb25_mux_t *ad_mux_state;
++};
++
++/*
++ * Per-mux descrambler state. Created lazily when a service on that mux first
++ * reports a B-CAS CAID; torn down when the last such service goes away.
++ */
++struct aribb25_mux {
++  LIST_ENTRY(aribb25_mux) am_link;
++  aribb25_t              *am_owner;
++  mpegts_mux_t           *am_mux;
++  ARIB_STD_B25           *am_b25;
++  B_CAS_CARD             *am_bcas;
++  int                     am_refcount;     /* live ECM PIDs */
++  int                     am_init_failed;  /* avoid log-spamming on retry */
++  tvh_mutex_t             am_lock;         /* serialises filter/teardown */
++  sbuf_t                  am_pending;      /* libaribb25 output backlog */
++};
++
++struct aribb25 {
++  caclient_t;
++
++  /* configurable via the web UI */
++  int    ab_card_backend;
++  int    ab_process_emm;
++  int    ab_multi2_round;
++  char  *ab_cobalt_card_image_path;
++  char  *ab_cobalt_log_file_path;
++  int    ab_cobalt_log_mode;
++
++  LIST_HEAD(, aribb25_mux) ab_muxes;
++  tvh_mutex_t              ab_lock;
++};
++
++/* ************************************************************************
++ * Per-mux helpers
++ * ***********************************************************************/
++
++static aribb25_mux_t *
++aribb25_mux_find ( aribb25_t *ab, mpegts_mux_t *mux )
++{
++  aribb25_mux_t *am;
++  LIST_FOREACH(am, &ab->ab_muxes, am_link)
++    if (am->am_mux == mux) return am;
++  return NULL;
++}
++
++static int
++aribb25_filter ( mpegts_mux_t *mm, uint8_t *buf, int len )
++{
++  aribb25_mux_t *am = mm->mm_filter_aux;
++  ARIB_STD_B25_BUFFER ibuf, obuf;
++  int outlen;
++
++  if (am == NULL || am->am_b25 == NULL)
++    return len;
++
++  tvh_mutex_lock(&am->am_lock);
++  if (am->am_b25 == NULL) {
++    tvh_mutex_unlock(&am->am_lock);
++    return len;
++  }
++
++  /* Feed input to libaribb25. */
++  ibuf.data = buf;
++  ibuf.size = (uint32_t)len;
++  if (am->am_b25->put(am->am_b25, &ibuf) < 0) {
++    tvh_mutex_unlock(&am->am_lock);
++    /* on a hard error pass the (still-scrambled) bytes through rather than
++     * silently dropping them; downstream will see scrambled flags set */
++    return len;
++  }
++
++  /* Pull whatever descrambled output is ready and append to the backlog.
++   * libaribb25 holds packets until an ECM is decoded, then emits them in
++   * bursts that may exceed the input batch — so we accumulate across
++   * calls and drain at most `len` bytes back into the caller's buffer. */
++  obuf.data = NULL;
++  obuf.size = 0;
++  if (am->am_b25->get(am->am_b25, &obuf) == 0 && obuf.size > 0)
++    sbuf_append(&am->am_pending, obuf.data, (int)obuf.size);
++
++  outlen = am->am_pending.sb_ptr;
++  if (outlen > len) outlen = len;
++  outlen -= outlen % 188;   /* keep packet boundaries clean */
++  if (outlen > 0) {
++    memcpy(buf, am->am_pending.sb_data, outlen);
++    sbuf_cut(&am->am_pending, outlen);
++  }
++
++  tvh_mutex_unlock(&am->am_lock);
++  return outlen;
++}
++
++static aribb25_mux_t *
++aribb25_mux_create ( aribb25_t *ab, mpegts_mux_t *mux )
++{
++  aribb25_mux_t *am;
++  int r;
++
++  am = calloc(1, sizeof(*am));
++  am->am_owner = ab;
++  am->am_mux   = mux;
++  tvh_mutex_init(&am->am_lock, NULL);
++  sbuf_init(&am->am_pending);
++
++  am->am_b25 = create_arib_std_b25();
++  if (am->am_b25 == NULL) {
++    tvherror(LS_ARIBB25, "create_arib_std_b25 failed");
++    goto fail;
++  }
++  am->am_b25->set_multi2_round(am->am_b25,
++                               ab->ab_multi2_round > 0 ? ab->ab_multi2_round : 4);
++  am->am_b25->set_strip(am->am_b25, 0);
++  am->am_b25->set_emm_proc(am->am_b25, ab->ab_process_emm ? 1 : 0);
++  am->am_b25->set_unit_size(am->am_b25, 188);
++
++  if (ab->ab_card_backend == ARIBB25_BACKEND_COBALT) {
++    b_cas_cobalt_set_card_image_path(ab->ab_cobalt_card_image_path);
++    b_cas_cobalt_set_log_file_path(ab->ab_cobalt_log_file_path);
++    b_cas_cobalt_set_log_mode(ab->ab_cobalt_log_mode);
++    am->am_bcas = create_b_cas_cobalt();
++  } else {
++    am->am_bcas = create_b_cas_card();
++  }
++  if (am->am_bcas == NULL) {
++    tvherror(LS_ARIBB25, "B-CAS card create failed (backend=%s)",
++             ab->ab_card_backend == ARIBB25_BACKEND_COBALT ? "cobalt" : "pcsc");
++    goto fail;
++  }
++  if ((r = am->am_bcas->init(am->am_bcas)) < 0) {
++    tvherror(LS_ARIBB25, "B-CAS card init failed (backend=%s, rc=%d)",
++             ab->ab_card_backend == ARIBB25_BACKEND_COBALT ? "cobalt" : "pcsc", r);
++    goto fail;
++  }
++  if ((r = am->am_b25->set_b_cas_card(am->am_b25, am->am_bcas)) < 0) {
++    tvherror(LS_ARIBB25, "set_b_cas_card failed (rc=%d)", r);
++    goto fail;
++  }
++
++  mux->mm_filter_aux     = am;
++  mux->mm_filter_packets = aribb25_filter;
++
++  LIST_INSERT_HEAD(&ab->ab_muxes, am, am_link);
++  tvhinfo(LS_ARIBB25, "mux %p: descrambler attached (backend=%s, emm=%d)",
++          mux,
++          ab->ab_card_backend == ARIBB25_BACKEND_COBALT ? "cobalt" : "pcsc",
++          ab->ab_process_emm ? 1 : 0);
++  caclient_set_status((caclient_t *)ab, CACLIENT_STATUS_CONNECTED);
++  return am;
++
++fail:
++  if (am->am_b25)
++    am->am_b25->release(am->am_b25);
++  if (am->am_bcas)
++    am->am_bcas->release(am->am_bcas);
++  sbuf_free(&am->am_pending);
++  tvh_mutex_destroy(&am->am_lock);
++  free(am);
++  caclient_set_status((caclient_t *)ab, CACLIENT_STATUS_DISCONNECTED);
++  return NULL;
++}
++
++static void
++aribb25_mux_destroy ( aribb25_mux_t *am )
++{
++  mpegts_mux_t *mux = am->am_mux;
++
++  tvh_mutex_lock(&am->am_lock);
++  mux->mm_filter_packets = NULL;
++  mux->mm_filter_aux     = NULL;
++  if (am->am_b25)  { am->am_b25->release(am->am_b25);   am->am_b25  = NULL; }
++  if (am->am_bcas) { am->am_bcas->release(am->am_bcas); am->am_bcas = NULL; }
++  sbuf_free(&am->am_pending);
++  tvh_mutex_unlock(&am->am_lock);
++
++  LIST_REMOVE(am, am_link);
++  tvh_mutex_destroy(&am->am_lock);
++  free(am);
++
++  tvhinfo(LS_ARIBB25, "mux %p: descrambler detached", mux);
++}
++
++static void
++aribb25_destroy_all_muxes ( aribb25_t *ab )
++{
++  aribb25_mux_t *am;
++  while ((am = LIST_FIRST(&ab->ab_muxes)) != NULL)
++    aribb25_mux_destroy(am);
++}
++
++/* ************************************************************************
++ * Per-service descrambler.
++ *
++ * The actual MULTI2 work is done at the mux level by `aribb25_filter`, but
++ * tvheadend still needs a `th_descrambler_t` registered on the service for
++ * the descrambler subsystem to consider the service descramblable
++ * (otherwise the subscription is rejected with "no descrambler"). The
++ * service-level descramble callback is `descrambler_pass` — by the time
++ * per-PID packets reach it they're already clear, since the mux filter ran
++ * first.
++ *
++ * Activation is driven from `cac_start` (mirroring dvbcam): when a service
++ * with a B-CAS CAID in its PMT starts, install / refcount the per-mux
++ * libaribb25 instance and register the per-service descrambler. The
++ * `cac_caid_update` callback only fires for CAT-derived EMM CAIDs, which is
++ * not enough for ARIB ISDB activation.
++ * ***********************************************************************/
++
++static void
++aribb25_service_destroy ( th_descrambler_t *td )
++{
++  aribb25_descrambler_t *ad = (aribb25_descrambler_t *)td;
++  aribb25_mux_t         *am = ad->ad_mux_state;
++
++  if (am) {
++    aribb25_t *ab = am->am_owner;
++    tvh_mutex_lock(&ab->ab_lock);
++    if (--am->am_refcount <= 0)
++      aribb25_mux_destroy(am);
++    tvh_mutex_unlock(&ab->ab_lock);
++  }
++
++  LIST_REMOVE(td, td_service_link);
++  free(td->td_nicename);
++  free(ad);
++}
++
++static void
++aribb25_service_start ( caclient_t *cac, struct service *t )
++{
++  aribb25_t                *ab = (aribb25_t *)cac;
++  th_descrambler_t         *td;
++  th_descrambler_runtime_t *dr;
++  elementary_stream_t      *st;
++  caid_t                   *c;
++  mpegts_service_t         *ms;
++  mpegts_mux_t             *mux;
++  aribb25_mux_t            *am;
++  aribb25_descrambler_t    *ad;
++  int                       found = 0;
++
++  if (!cac->cac_enabled)
++    return;
++
++  tvh_mutex_lock(&t->s_stream_mutex);
++
++  /* Does this service carry a B-CAS CAID? */
++  TAILQ_FOREACH(st, &t->s_components.set_all, es_link) {
++    if (st->es_type != SCT_CA) continue;
++    LIST_FOREACH(c, &st->es_caids, link) {
++      if (c->use && c->caid == ARIBB25_BCAS_CAID) {
++        found = 1;
++        break;
++      }
++    }
++    if (found) break;
++  }
++  if (!found) {
++    tvh_mutex_unlock(&t->s_stream_mutex);
++    return;
++  }
++
++  /* Already attached on this service? */
++  LIST_FOREACH(td, &t->s_descramblers, td_service_link) {
++    if (td->td_stop == aribb25_service_destroy) {
++      tvh_mutex_unlock(&t->s_stream_mutex);
++      return;
++    }
++  }
++
++  ms  = (mpegts_service_t *)t;
++  mux = ms->s_dvb_mux;
++  if (mux == NULL) {
++    tvh_mutex_unlock(&t->s_stream_mutex);
++    return;
++  }
++
++  /* Per-mux libaribb25 instance + packet filter (refcounted across services). */
++  tvh_mutex_lock(&ab->ab_lock);
++  am = aribb25_mux_find(ab, mux);
++  if (am == NULL)
++    am = aribb25_mux_create(ab, mux);
++  if (am != NULL)
++    am->am_refcount++;
++  tvh_mutex_unlock(&ab->ab_lock);
++  if (am == NULL) {
++    tvh_mutex_unlock(&t->s_stream_mutex);
++    return;
++  }
++
++  ad = calloc(1, sizeof(*ad));
++  ad->ad_mux_state = am;
++  td               = (th_descrambler_t *)ad;
++  td->td_nicename  = strdup("aribb25");
++  td->td_service   = t;
++  td->td_stop      = aribb25_service_destroy;
++
++  dr = ms->s_descramble;
++  if (dr) {
++    dr->dr_descrambler = td;
++    dr->dr_descramble  = descrambler_pass;
++  }
++  descrambler_change_keystate(td, DS_READY, 0);
++  LIST_INSERT_HEAD(&t->s_descramblers, td, td_service_link);
++
++  tvh_mutex_unlock(&t->s_stream_mutex);
++
++  tvhinfo(LS_ARIBB25, "service %p: descrambler attached (mux=%p)", t, mux);
++}
++
++static void
++aribb25_conf_changed ( caclient_t *cac )
++{
++  aribb25_t *ab = (aribb25_t *)cac;
++
++  /* Tear down all per-mux state. Future cac_caid_update notifications will
++   * rebuild it with the new configuration. */
++  tvh_mutex_lock(&ab->ab_lock);
++  aribb25_destroy_all_muxes(ab);
++  tvh_mutex_unlock(&ab->ab_lock);
++
++  if (cac->cac_enabled)
++    caclient_set_status(cac, CACLIENT_STATUS_READY);
++  else
++    caclient_set_status(cac, CACLIENT_STATUS_NONE);
++}
++
++static void
++aribb25_free ( caclient_t *cac )
++{
++  aribb25_t *ab = (aribb25_t *)cac;
++
++  tvh_mutex_lock(&ab->ab_lock);
++  aribb25_destroy_all_muxes(ab);
++  tvh_mutex_unlock(&ab->ab_lock);
++
++  free(ab->ab_cobalt_card_image_path);
++  free(ab->ab_cobalt_log_file_path);
++  tvh_mutex_destroy(&ab->ab_lock);
++}
++
++/* ************************************************************************
++ * Class
++ * ***********************************************************************/
++
++static htsmsg_t *
++aribb25_class_backend_list ( void *o, const char *lang )
++{
++  static const struct strtab tab[] = {
++    { N_("CobaltCas (software Blue Card emulator)"), ARIBB25_BACKEND_COBALT },
++    { N_("PC/SC (physical B-CAS card)"),             ARIBB25_BACKEND_PCSC   },
++  };
++  return strtab2htsmsg(tab, 1, lang);
++}
++
++const idclass_t caclient_aribb25_class =
++{
++  .ic_super      = &caclient_class,
++  .ic_class      = "caclient_aribb25",
++  .ic_caption    = N_("ARIB STD-B25 (Japanese ISDB)"),
++  .ic_groups     = (const property_group_t[]) {
++    { .name = N_("General Settings"), .number = 1 },
++    { .name = N_("Card"),             .number = 2 },
++    { .name = N_("CobaltCas"),        .number = 3 },
++    { .name = N_("Advanced"),         .number = 4 },
++    {}
++  },
++  .ic_properties = (const property_t[]){
++    {
++      .type   = PT_INT,
++      .id     = "card_backend",
++      .name   = N_("Card backend"),
++      .desc   = N_("How libaribb25 talks to a B-CAS card: a software "
++                   "CobaltCas Blue Card emulator, or a physical card via PC/SC."),
++      .off    = offsetof(aribb25_t, ab_card_backend),
++      .list   = aribb25_class_backend_list,
++      .opts   = PO_DOC_NLIST,
++      .group  = 2,
++    },
++    {
++      .type   = PT_BOOL,
++      .id     = "process_emm",
++      .name   = N_("Process EMM"),
++      .desc   = N_("Forward EMMs to the card so a physical Red Card keeps "
++                   "receiving entitlement updates (required to keep pay "
++                   "channels working long-term). CobaltCas / Blue Cards have "
++                   "no entitlement state, leave this off."),
++      .off    = offsetof(aribb25_t, ab_process_emm),
++      .group  = 2,
++    },
++    {
++      .type   = PT_STR,
++      .id     = "cobalt_card_image",
++      .name   = N_("Card image file"),
++      .desc   = N_("Path to the CobaltCas card image (`*.bin`). CobaltCas "
++                   "auto-creates a fresh image with its built-in default "
++                   "Blue Card data on first use, and persists state across "
++                   "restarts. Only used when the card backend is CobaltCas."),
++      .off    = offsetof(aribb25_t, ab_cobalt_card_image_path),
++      .group  = 3,
++    },
++    {
++      .type   = PT_STR,
++      .id     = "cobalt_log_file",
++      .name   = N_("Log file"),
++      .desc   = N_("Optional path to a CobaltCas log file."),
++      .off    = offsetof(aribb25_t, ab_cobalt_log_file_path),
++      .opts   = PO_ADVANCED,
++      .group  = 3,
++    },
++    {
++      .type   = PT_INT,
++      .id     = "cobalt_log_mode",
++      .name   = N_("Log mode"),
++      .desc   = N_("CobaltCas log verbosity bitmask: 0=off, 1=all, 2=EMM, "
++                   "4=EMG, 8=EMD, 16=ECM, 32=CHK, 64=startup, 128=other."),
++      .off    = offsetof(aribb25_t, ab_cobalt_log_mode),
++      .opts   = PO_ADVANCED | PO_HEXA,
++      .group  = 3,
++    },
++    {
++      .type   = PT_INT,
++      .id     = "multi2_round",
++      .name   = N_("MULTI2 cipher rounds"),
++      .desc   = N_("Number of MULTI2 rounds. ARIB-spec default is 4."),
++      .off    = offsetof(aribb25_t, ab_multi2_round),
++      .opts   = PO_EXPERT,
++      .group  = 4,
++    },
++    {}
++  }
++};
++
++/* ************************************************************************
++ * Construction
++ * ***********************************************************************/
++
++caclient_t *
++aribb25_create ( void )
++{
++  aribb25_t *ab = calloc(1, sizeof(*ab));
++
++  ab->ab_card_backend  = ARIBB25_BACKEND_COBALT;
++  ab->ab_process_emm   = 0;
++  ab->ab_multi2_round  = 4;
++  ab->ab_cobalt_log_mode = 0;
++  LIST_INIT(&ab->ab_muxes);
++  tvh_mutex_init(&ab->ab_lock, NULL);
++
++  ((caclient_t *)ab)->cac_free         = aribb25_free;
++  ((caclient_t *)ab)->cac_start        = aribb25_service_start;
++  ((caclient_t *)ab)->cac_conf_changed = aribb25_conf_changed;
++  return (caclient_t *)ab;
++}
+--- a/src/descrambler/caclient.c
++++ b/src/descrambler/caclient.c
+@@ -40,6 +40,9 @@ const idclass_t *caclient_classes[] = {
+   &caclient_ccw_aes_ecb_class,
+   &caclient_ccw_aes128_ecb_class,
+ #endif
++#if ENABLE_ARIBB25
++  &caclient_aribb25_class,
++#endif
+   NULL
+ };
+ 
+@@ -124,6 +127,10 @@ caclient_create
+       c == &caclient_ccw_aes128_ecb_class)
+     cac = constcw_create();
+ #endif
++#if ENABLE_ARIBB25
++  if (c == &caclient_aribb25_class)
++    cac = aribb25_create();
++#endif
+   if (cac == NULL) {
+     tvherror(LS_CACLIENT, "CA Client class %s is not available!", s);
+     return NULL;
+--- a/src/descrambler/caclient.h
++++ b/src/descrambler/caclient.h
+@@ -35,6 +35,7 @@ extern const idclass_t caclient_ccw_csa_
+ extern const idclass_t caclient_ccw_des_ncb_class;
+ extern const idclass_t caclient_ccw_aes_ecb_class;
+ extern const idclass_t caclient_ccw_aes128_ecb_class;
++extern const idclass_t caclient_aribb25_class;
+ 
+ TAILQ_HEAD(caclient_entry_queue, caclient);
+ 
+@@ -101,5 +102,6 @@ caclient_t *cccam_create(void);
+ caclient_t *capmt_create(void);
+ caclient_t *constcw_create(void);
+ caclient_t *tsdebugcw_create(void);
++caclient_t *aribb25_create(void);
+ 
+ #endif /* __TVH_CACLIENT_H__ */
+--- a/src/input/mpegts.h
++++ b/src/input/mpegts.h
+@@ -529,6 +529,16 @@ struct mpegts_mux
+   int  (*mm_is_epg)           (mpegts_mux_t*);
+ 
+   /*
++   * Optional per-mux packet filter (e.g. ARIB STD-B25 descrambler).
++   *
++   * Invoked from mpegts_input_recv_packets on the just-copied mux buffer
++   * after sync. The filter modifies `buf` in place and returns the new
++   * length (must be <= the input `len`; 0 to drop the batch).
++   */
++  int  (*mm_filter_packets)   (mpegts_mux_t *mm, uint8_t *buf, int len);
++  void  *mm_filter_aux;
++
++  /*
+    * Configuration
+    */
+   char    *mm_crid_authority;
+--- a/src/input/mpegts/mpegts_input.c
++++ b/src/input/mpegts/mpegts_input.c
+@@ -1272,6 +1272,14 @@ retry:
+     mp->mp_cc_restart = (flags & MPEGTS_DATA_CC_RESTART) ? 1 : 0;
+ 
+     memcpy(mp->mp_data, tsb, len2);
++
++    /* Optional per-mux packet filter (e.g. ARIB STD-B25 descrambler).
++     * Filters operate in place; returned length must be <= len2. */
++    if (mmi->mmi_mux->mm_filter_packets) {
++      int fr = mmi->mmi_mux->mm_filter_packets(mmi->mmi_mux, mp->mp_data, len2);
++      mp->mp_len = (fr >= 0 && fr <= len2) ? fr : 0;
++    }
++
+     if (mi->mi_remove_scrambled_bits || (flags & MPEGTS_DATA_REMOVE_SCRAMBLED) != 0) {
+       uint8_t *tmp, *end;
+       for (tmp = mp->mp_data, end = mp->mp_data + len2; tmp < end; tmp += 188)
+--- a/src/tvhlog.c
++++ b/src/tvhlog.c
+@@ -170,6 +170,7 @@ tvhlog_subsys_t tvhlog_subsystems[] = {
+   [LS_SATIPS]        = { "satips",        N_("SAT>IP Server") },
+   [LS_TVHDHOMERUN]   = { "tvhdhomerun",   N_("TVHDHomeRun Client") },
+   [LS_PX4]           = { "px4",           N_("px4_drv") },
++  [LS_ARIBB25]       = { "aribb25",       N_("ARIB STD-B25 descrambler") },
+   [LS_PSIP]          = { "psip",          N_("ATSC PSIP EPG") },
+   [LS_OPENTV]        = { "opentv",        N_("OpenTV EPG") },
+   [LS_PYEPG]         = { "pyepg",         N_("PyEPG Import") },
+--- a/src/tvhlog.h
++++ b/src/tvhlog.h
+@@ -189,6 +189,7 @@ enum {
+   LS_SATIPS,
+   LS_TVHDHOMERUN,
+   LS_PX4,
++  LS_ARIBB25,
+   LS_PSIP,
+   LS_OPENTV,
+   LS_PYEPG,
+--- a/src/webui/static/app/caclient.js
++++ b/src/webui/static/app/caclient.js
+@@ -25,7 +25,9 @@ tvheadend.caclient = function(panel, ind
+     var list = 'enabled,name,username,password,hostname,mode,camdfilename,' +
+                'port,cwmode,deskey,emm,emmex,caid,providerid,tsid,sid,' +
+                'key_even,key_odd,keepalive_interval,comment,extended,' +
+-               'nodeid,version,limit,caid_select,caid_list,multi';
++               'nodeid,version,limit,caid_select,caid_list,multi,' +
++               'card_backend,process_emm,cobalt_card_image,' +
++               'cobalt_log_file,cobalt_log_mode,multi2_round';
+ 
+     tvheadend.idnode_form_grid(panel, {
+         clazz: 'caclient',
