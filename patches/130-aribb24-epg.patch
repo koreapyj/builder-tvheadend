@@ -1,6 +1,44 @@
---- a/src/epggrab/module/eit.c
-+++ b/src/epggrab/module/eit.c
-@@ -184,6 +184,41 @@ static dvb_string_conv_t _eit_freesat_co
+Index: src/src/epggrab/module/eit.c
+===================================================================
+--- src.orig/src/epggrab/module/eit.c
++++ src/src/epggrab/module/eit.c
+@@ -81,6 +81,7 @@ typedef struct eit_data
+ {
+   tvh_uuid_t svc_uuid;
+   uint16_t   onid;
++  uint16_t   tsid;
+   int        tableid;
+   int        sect;
+   int        local_time;
+@@ -110,6 +111,16 @@ static TAILQ_HEAD(, eit_private) eit_pri
+  * Status handling
+  * ***********************************************************************/
+ 
++#define EIT_GROUP_REF_MAX 8
++
++typedef struct eit_event_ref
++{
++  uint16_t onid;   /* 0 = use carrying mux's onid (same-TS reference) */
++  uint16_t tsid;   /* 0 = use carrying mux's tsid (same-TS reference) */
++  uint16_t sid;
++  uint16_t eid;
++} eit_event_ref_t;
++
+ typedef struct eit_event
+ {
+   char              uri[529];
+@@ -141,6 +152,10 @@ typedef struct eit_event
+   time_t            first_aired;
+   uint16_t          copyright_year;
+ 
++  uint8_t           group_type;         /* 0 = none, else ARIB 1..5 */
++  uint8_t           group_ref_count;
++  eit_event_ref_t   group_refs[EIT_GROUP_REF_MAX];
++
+ } eit_event_t;
+ 
+ 
+@@ -184,6 +199,41 @@ static dvb_string_conv_t _eit_freesat_co
    { 0x00, NULL }
  };
  
@@ -42,7 +80,7 @@
  /*
   * Get string
   */
-@@ -202,6 +237,24 @@ static int _eit_get_string_with_len
+@@ -202,6 +252,24 @@ static int _eit_get_string_with_len
    return dvb_get_string_with_len(dst, dstlen, src, srclen, charset, cptr);
  }
  
@@ -67,7 +105,7 @@
  /*
   * Short Event - 0x4d
   */
-@@ -224,7 +277,11 @@ static int _eit_desc_short_event
+@@ -224,7 +292,11 @@ static int _eit_desc_short_event
    if ( (r = _eit_get_string_with_len(mod, buf, sizeof(buf),
                                       ptr, len, ev->default_charset)) < 0 ) {
      return -1;
@@ -80,7 +118,7 @@
      if (!ev->title) ev->title = lang_str_create();
      lang_str_add(ev->title, buf, lang);
    }
-@@ -237,7 +294,8 @@ static int _eit_desc_short_event
+@@ -237,7 +309,8 @@ static int _eit_desc_short_event
    if ( (r = _eit_get_string_with_len(mod, buf, sizeof(buf),
                                       ptr, len, ev->default_charset)) < 0 ) {
      return -1;
@@ -90,7 +128,7 @@
      if (!ev->summary) ev->summary = lang_str_create();
      lang_str_add(ev->summary, buf, lang);
    }
-@@ -298,6 +356,21 @@ static int _eit_desc_ext_event
+@@ -298,6 +371,21 @@ static int _eit_desc_ext_event
      ilen -= r;
      iptr += r;
  
@@ -112,7 +150,7 @@
      /* Store */
      // TODO: extend existing?
  #if TODO_ADD_EXTRA
-@@ -395,6 +468,22 @@ static int _eit_desc_content
+@@ -395,6 +483,22 @@ static int _eit_desc_content
  {
    uint8_t tempPtr = 0;  //Temporary variable to hold a (potentially) changed *ptr value.
    tempPtr = *ptr;
@@ -135,7 +173,7 @@
    while (len > 1) {
      //If the genre translation table has been loaded, it will not be a null pointer.
      if (epggrab_ota_genre_translation){
-@@ -552,6 +641,84 @@ static int _eit_desc_crid
+@@ -552,6 +656,184 @@ static int _eit_desc_crid
    return 0;
  }
  
@@ -180,47 +218,147 @@
 +}
 +
 +/*
-+ * ARIB Event Group Descriptor - 0xD6
++ * ARIB Event Group Descriptor - 0xD6 (ARIB STD-B10)
 + *
-+ * Describes a relay / shared-event relation. Tvheadend has no data model for
-+ * this, so it is surfaced as a short informational note on the description.
++ *   group_type : 4   event_count : 4
++ *   for (i=0; i<event_count; i++) { service_id:16  event_id:16 }
++ *   if (group_type == 4 || group_type == 5) {
++ *     for (each remaining tuple) {
++ *       original_network_id:16  transport_stream_id:16
++ *       service_id:16            event_id:16
++ *     }
++ *   }
++ *
++ * The same-TS entries reference events on the carrying mux (no onid/tsid
++ * carried, so the caller's coordinates apply). group_type 4/5 (other-network)
++ * carries full (onid,tsid,sid,eid) tuples in the trailing block.
++ *
++ * Records the references on the event for later resolution. The slave-service
++ * EIT normally has a blank or placeholder short_event_descriptor; the resolver
++ * (called near _eit_process_event_one's finish) copies the master event's
++ * title onto the slave.
 + */
 +static int _eit_desc_event_group
 +  ( epggrab_module_t *mod, const uint8_t *ptr, int len, eit_event_t *ev )
 +{
-+  static const char *types[6] = {
-+    NULL,
-+    "[イベント共有]",
-+    "[イベントリレー]",
-+    "[イベントリレー]",
-+    "[イベントリレー(他NW)]",
-+    "[イベント移動(他NW)]",
-+  };
-+  uint8_t group_type;
-+  const char *note;
++  uint8_t group_type, event_count, i;
++  int pos;
 +
 +  if (!_eit_is_arib(ev)) return 0;
 +  if (len < 1) return 0;
 +
-+  group_type = ptr[0] >> 4;
-+  tvhtrace(mod->subsys, "%s:  ARIB event group type %u", mod->id, group_type);
++  group_type  = ptr[0] >> 4;
++  event_count = ptr[0] & 0x0f;
++  ev->group_type = group_type;
 +
-+  note = group_type < 6 ? types[group_type] : NULL;
-+  if (note) {
-+    char gline[64];
-+    snprintf(gline, sizeof(gline), "\n%s", note);
-+    if (!ev->desc) ev->desc = lang_str_create();
-+    lang_str_append(ev->desc, gline, "jpn");
++  tvhtrace(mod->subsys,
++           "%s:  ARIB event group type %u count %u",
++           mod->id, group_type, event_count);
++
++  /* Same-TS (sid,eid) pairs, always present */
++  pos = 1;
++  for (i = 0; i < event_count; i++) {
++    if (pos + 4 > len) break;
++    if (ev->group_ref_count < EIT_GROUP_REF_MAX) {
++      eit_event_ref_t *r = &ev->group_refs[ev->group_ref_count++];
++      r->onid = 0;
++      r->tsid = 0;
++      r->sid  = (ptr[pos] << 8) | ptr[pos+1];
++      r->eid  = (ptr[pos+2] << 8) | ptr[pos+3];
++    }
++    pos += 4;
++  }
++
++  /* Other-network full tuples (onid,tsid,sid,eid) */
++  if (group_type == 4 || group_type == 5) {
++    while (pos + 8 <= len) {
++      if (ev->group_ref_count < EIT_GROUP_REF_MAX) {
++        eit_event_ref_t *r = &ev->group_refs[ev->group_ref_count++];
++        r->onid = (ptr[pos]   << 8) | ptr[pos+1];
++        r->tsid = (ptr[pos+2] << 8) | ptr[pos+3];
++        r->sid  = (ptr[pos+4] << 8) | ptr[pos+5];
++        r->eid  = (ptr[pos+6] << 8) | ptr[pos+7];
++      }
++      pos += 8;
++    }
 +  }
 +
 +  return 0;
++}
++
++/*
++ * ARIB event_group_descriptor resolver
++ *
++ * Looks up the master event referenced by the (sid,eid) — or full
++ * (onid,tsid,sid,eid) for other-network types — and copies its title
++ * (and other empty fields) onto the slave event. Single-pass: if the
++ * master is not yet in the EPG DB, the next cyclic EIT pass will retry.
++ * Must run with global_lock held.
++ */
++static void _eit_resolve_event_group
++  ( epggrab_module_t *mod, eit_data_t *ed, mpegts_service_t *carry_svc,
++    eit_event_t *ev )
++{
++  mpegts_network_t *mn;
++  mpegts_mux_t *mm;
++  mpegts_service_t *msvc;
++  idnode_list_mapping_t *ilm;
++  channel_t *ch;
++  epg_broadcast_t *master;
++  uint16_t onid, tsid;
++  const char *t;
++  int i;
++
++  if (ev->group_ref_count == 0) return;
++  if (!carry_svc || !carry_svc->s_dvb_mux) return;
++  mn = carry_svc->s_dvb_mux->mm_network;
++  if (!mn) return;
++
++  for (i = 0; i < ev->group_ref_count; i++) {
++    eit_event_ref_t *r = &ev->group_refs[i];
++    onid = r->onid ? r->onid : ed->onid;
++    tsid = r->tsid ? r->tsid : ed->tsid;
++
++    mm = mpegts_network_find_mux(mn, onid, tsid, 1);
++    if (!mm) continue;
++    msvc = mpegts_mux_find_service(mm, r->sid);
++    if (!msvc) continue;
++
++    LIST_FOREACH(ilm, &msvc->s_channels, ilm_in1_link) {
++      ch = (channel_t *)ilm->ilm_in2;
++      if (!ch->ch_enabled) continue;
++      master = epg_broadcast_find_by_eid(ch, r->eid);
++      if (!master) continue;
++
++      /* Title: overwrite — the broadcaster's slave placeholder is what we
++       * want to replace. */
++      if (master->title) {
++        if (ev->title) lang_str_destroy(ev->title);
++        ev->title = lang_str_copy(master->title);
++      }
++      /* Secondary fields: only fill when slave provided nothing. */
++      if (!ev->subtitle && master->subtitle)
++        ev->subtitle = lang_str_copy(master->subtitle);
++      if (!ev->summary && master->summary)
++        ev->summary = lang_str_copy(master->summary);
++      if (!ev->desc && master->description)
++        ev->desc = lang_str_copy(master->description);
++
++      t = ev->title ? lang_str_get(ev->title, NULL) : NULL;
++      tvhtrace(mod->subsys,
++               "%s:  event_group resolved type=%u onid=%u tsid=%u sid=%u eid=%u -> '%s'",
++               mod->id, ev->group_type, onid, tsid, r->sid, r->eid,
++               t ? t : "");
++      return;
++    }
++  }
 +}
 +#endif
 +
  /*
   *
   */
-@@ -963,7 +1130,16 @@ static int _eit_process_event_one
+@@ -963,7 +1245,16 @@ static int _eit_process_event_one
    if (ev->copyright_year > 0)
      *save |= epg_broadcast_set_copyright_year(ebc, ev->copyright_year, &changes);
  
@@ -238,7 +376,7 @@
  
  
  running:
-@@ -1051,6 +1227,14 @@ static int _eit_process_event
+@@ -1051,6 +1342,14 @@ static int _eit_process_event
        case DVB_DESC_CRID:
          r = _eit_desc_crid(mod, ptr, dlen, &ev, ed);
          break;
@@ -253,8 +391,29 @@
        default:
          r = 0;
          _eit_dtag_dump(mod, dtag, dlen, ptr);
---- a/src/input/mpegts/dvb.h
-+++ b/src/input/mpegts/dvb.h
+@@ -1083,6 +1382,10 @@ static int _eit_process_event
+   if (lock)
+     tvh_mutex_lock(&global_lock);
+   svc = (mpegts_service_t *)service_find_by_uuid0(&ed->svc_uuid);
++#if ENABLE_ARIBB24
++  if (svc && ev.group_ref_count)
++    _eit_resolve_event_group(mod, ed, svc, &ev);
++#endif
+   if (svc && eit_mod->opaque) {
+     LIST_FOREACH(ilm, &svc->s_channels, ilm_in1_link) {
+       ch = (channel_t *)ilm->ilm_in2;
+@@ -1304,6 +1607,7 @@ svc_ok:
+     data->sect = sect;
+     data->svc_uuid = svc->s_id.in_uuid;
+     data->onid = onid;
++    data->tsid = tsid;
+     data->local_time = mm->mm_network->mn_localtime;
+     if (cridauth_len) {
+       data->cridauth_len = cridauth_len;
+Index: src/src/input/mpegts/dvb.h
+===================================================================
+--- src.orig/src/input/mpegts/dvb.h
++++ src/src/input/mpegts/dvb.h
 @@ -178,6 +178,8 @@ struct lang_str;
  #define DVB_DESC_FREESAT_REGIONS      0xD4
  
