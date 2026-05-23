@@ -94,6 +94,16 @@ ARIB / ISDB feature patches:
   logos are reconstructed and applied exactly as for the CDT (patch 150). Implemented to the
   ARIB TR-B15 spec — it needs a transport that actually carries the carousel (a real ISDB-S
   tuner, or a full-transponder stream); service-filtered IPTV streams strip it.
+- **`170-arib-channel-number.patch`** — populates ISDB channel numbers. The standard DVB
+  logical-channel-number descriptors (0x83 etc.) are not used by ISDB; instead ARIB STD-B10
+  carries the channel number ("リモコン番号") in the **TS Information descriptor** (tag
+  `0xCD`) inside NIT, as a per-TS `remote_control_key_id` plus a list of `service_id`s. The
+  patch parses that descriptor in the NIT TS-loop, walking the per-transmission-type service
+  lists and assigning each service's `s_dvb_channel_num` from `remote_control_key_id` and
+  `s_dvb_channel_minor` from the low 3 bits of `service_id` (the per-broadcaster service
+  offset, per ARIB TR-B14), giving the familiar Japanese "X.Y" channel display (e.g. 4.1 for
+  NTV primary, 4.2 for the sub-service). Without this, every ISDB service scanned by
+  tvheadend shows channel number 0.0.
 
 ## Local patch development
 

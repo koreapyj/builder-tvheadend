@@ -1,0 +1,66 @@
+--- a/src/input/mpegts/dvb.h
++++ b/src/input/mpegts/dvb.h
+@@ -182,6 +182,7 @@ struct lang_str;
+ #define DVB_DESC_FREESAT_REGIONS      0xD4
+ 
+ /* ARIB STD-B10 (ISDB) */
++#define DVB_DESC_ARIB_TS_INFO         0xCD
+ #define DVB_DESC_LOGO_TRANSMISSION    0xCF
+ #define DVB_DESC_ARIB_SERIES          0xD5
+ #define DVB_DESC_ARIB_EVENT_GROUP     0xD6
+--- a/src/input/mpegts/dvb_psi.c
++++ b/src/input/mpegts/dvb_psi.c
+@@ -1389,6 +1389,53 @@ lcn:
+       }
+ #endif
+       break;
++#if ENABLE_ARIBB24
++    case DVB_DESC_ARIB_TS_INFO:
++      /* ARIB STD-B10 TS_information_descriptor: per-TS remote_control_key_id
++       * is the ISDB channel number ("リモコン番号"). Layout:
++       *   remote_control_key_id(8) length_of_ts_name(6) txn_type_count(2)
++       *   ts_name_char[length_of_ts_name]
++       *   for (i<txn_type_count) { txn_type_info(8) n_svc(8) sid[n_svc](16) }
++       */
++      if (mux && dlen >= 2) {
++        const uint8_t *p = dptr;
++        int rem = dlen, name_len, n_types, n_svc, save;
++        uint8_t rcid = p[0];
++        name_len = (p[1] >> 2) & 0x3f;
++        n_types  =  p[1]       & 0x03;
++        p += 2; rem -= 2;
++        if (rem >= name_len) {
++          p += name_len; rem -= name_len;
++          while (n_types-- > 0 && rem >= 2) {
++            n_svc = p[1];
++            p += 2; rem -= 2;
++            while (n_svc-- > 0 && rem >= 2) {
++              uint16_t sid = extract_svcid(p);
++              p += 2; rem -= 2;
++              if (rcid) {
++                /* ARIB TR-B14 service-id allocation: the lower 3 bits of
++                 * service_id are the service offset within the broadcaster,
++                 * so the displayed minor channel is (sid & 0x07) + 1. */
++                uint16_t minor = (sid & 0x07) + 1;
++                mpegts_service_t *s = mpegts_service_find(mux, sid, 0, 0, &save);
++                if (s && (!s->s_dvb_channel_dtag ||
++                           s->s_dvb_channel_dtag == dtag) &&
++                    (s->s_dvb_channel_num != rcid ||
++                     s->s_dvb_channel_minor != minor)) {
++                  s->s_dvb_channel_dtag  = dtag;
++                  s->s_dvb_channel_num   = rcid;
++                  s->s_dvb_channel_minor = minor;
++                  mpegts_network_bouquet_trigger(mn, 0);
++                  idnode_changed(&s->s_id);
++                  service_refresh_channel((service_t*)s);
++                }
++              }
++            }
++          }
++        }
++      }
++      break;
++#endif
+     }
+   }}
+ 
