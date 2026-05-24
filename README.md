@@ -51,14 +51,6 @@ ARIB / ISDB feature patches; **`5xx`** is reserved for additional device / tuner
   socket. The patch trims the dangling partial character with `utf8_validate_inplace()`.
   Not ARIB-specific — a generic Tvheadend buffer-truncation bug that long multibyte titles
   expose.
-- **`002-isdb-s-linuxdvb-tune.patch`** — fixes ISDB-S tuning on Linux DVB adapters.
-  Tvheadend already has ISDB-S support throughout (FE type, delivery system, network / mux /
-  frontend classes, S2API tune commands), but the legacy parameter-copy `switch` in
-  `linuxdvb_frontend_tune()` is missing the `DVB_TYPE_ISDB_S` case, so every ISDB-S tune hits
-  the `default` arm, logs `unknown FE type 9`, and returns `SM_CODE_TUNING_FAILED` before the
-  S2API path runs. The patch adds `case DVB_TYPE_ISDB_S` to the `ISDB_T`/`DAB` group — ISDB-S,
-  like ISDB-T, carries no legacy `dvb_frontend_parameters` data and is tuned purely via the
-  S2API. Not ARIB-specific — a generic upstream bug that blocks all ISDB-S reception.
 - **`110-aribb24-text-encoding.patch`** — adds **ARIB STD-B24** (Japanese ISDB) text
   decoding via `libaribb24`, exposed as an `ARIB-STD-B24` option in the *Character set*
   dropdown (network / mux / service). When selected, every SI/EPG string from that tuner is
@@ -79,6 +71,20 @@ ARIB / ISDB feature patches; **`5xx`** is reserved for additional device / tuner
   makes `epg_broadcast_change_finish()` wipe the title/genre/description a fuller pass set
   (which made entries flicker between filled and empty). The ARIB descriptor paths activate
   only for services whose *Character set* is `ARIB-STD-B24`.
+- **`140-isdb-s-broadcast-support.patch`** — fills the ISDB-S gaps tvheadend has upstream.
+  Tvheadend ships an ISDB-S FE type, delivery-system enum, network / mux / frontend classes
+  and S2API tune commands, but four spots assume the type does not exist: the legacy
+  parameter-copy `switch` in `linuxdvb_frontend_tune()` misses `DVB_TYPE_ISDB_S` (every tune
+  returns `SM_CODE_TUNING_FAILED` with "unknown FE type 9"); the scanfile loader's
+  region-type allow-list omits `isdb-s` and `scanfile_load_dvbv5()` has no `DVB_SYS_ISDBS`
+  branch (any Japan BS/CS preset is silently dropped); the mux `display_name` only treats
+  `DVB_TYPE_S` as kHz-stored and routes ISDB-S through the Hz-storage path (so a
+  11 727 480 kHz BS mux renders as "11.727 MHz"); and `dvb_mux_conf_init()` never sets a
+  default polarisation/symbol-rate for ISDB-S, so on restart the saved mux loses its R/28.86
+  Mbaud and the WebUI shows "H" until next tune. The patch adds the missing `DVB_TYPE_ISDB_S`
+  case in each spot — including a parse branch that reads `POLARIZATION`, `SYMBOL_RATE`,
+  `STREAM_ID` and `INVERSION` so the seedfile values reach `dmc_fe_qpsk` for the linuxdvb
+  tune ioctls (`DTV_VOLTAGE` / `DTV_SYMBOL_RATE`).
 - **`150-isdb-cdt-logo.patch`** — extracts **ISDB station logos** from the CDT (Common Data
   Table, PID `0x29`) and uses them as channel icons. ISDB broadcasts each broadcaster's logo
   as a palettised PNG with the `PLTE`/`tRNS` chunks stripped; the patch parses the CDT,

@@ -1,0 +1,81 @@
+--- a/src/input/mpegts/dvb_support.c
++++ b/src/input/mpegts/dvb_support.c
+@@ -1090,6 +1090,15 @@ dvb_mux_conf_init ( mpegts_network_t *ln
+   case DVB_TYPE_S:
+     dmc->u.dmc_fe_qpsk.orbital_pos = INT_MAX;
+     break;
++  case DVB_TYPE_ISDB_S:
++    /* ARIB STD-B20 fixes ISDB-S to right-hand circular polarisation and
++     * 28.86 Mbaud nominal. The ISDB-S mux class doesn't expose either
++     * field to the UI, so they're never restored from saved conf — defaulting
++     * them here keeps tune ioctls and the mux display ("11727.480R") correct
++     * across restarts. */
++    dmc->u.dmc_fe_qpsk.polarisation = DVB_POLARISATION_CIRCULAR_RIGHT;
++    dmc->u.dmc_fe_qpsk.symbol_rate  = 28860000;
++    break;
+   default:
+     break;
+   }
+--- a/src/input/mpegts/linuxdvb/linuxdvb_frontend.c
++++ b/src/input/mpegts/linuxdvb/linuxdvb_frontend.c
+@@ -1804,6 +1804,7 @@ linuxdvb_frontend_tune0
+     break;
+ #if DVB_API_VERSION >= 5
+   case DVB_TYPE_ISDB_T:
++  case DVB_TYPE_ISDB_S:
+   case DVB_TYPE_DAB:
+     break;
+ #endif
+--- a/src/input/mpegts/mpegts_mux_dvb.c
++++ b/src/input/mpegts/mpegts_mux_dvb.c
+@@ -1149,7 +1149,7 @@ dvb_mux_display_name ( mpegts_mux_t *mm,
+   if (lm->lm_tuning.dmc_fe_type == DVB_TYPE_CABLECARD)
+     snprintf(buf, len, "%u", lm->lm_tuning.u.dmc_fe_cablecard.vchannel);
+   else {
+-    if (ln->ln_type == DVB_TYPE_S) {
++    if (ln->ln_type == DVB_TYPE_S || ln->ln_type == DVB_TYPE_ISDB_S) {
+       const char *s = dvb_pol2str(lm->lm_tuning.u.dmc_fe_qpsk.polarisation);
+       if (s) extra[0] = *s;
+       extra[1] = '\0';
+--- a/src/input/mpegts/scanfile.c
++++ b/src/input/mpegts/scanfile.c
+@@ -43,7 +43,8 @@ static const char *scanfile_region_types
+   { "dvb-c", "dvbc" },
+   { "atsc-t", NULL  },
+   { "atsc-c", NULL  },
+-  { "isdb-t", NULL  }
++  { "isdb-t", NULL  },
++  { "isdb-s", NULL  }
+ };
+ 
+ #define REGIONS ARRAY_SIZE(scanfile_region_types)
+@@ -710,6 +711,29 @@ scanfile_load_dvbv5
+     mux->u.dmc_fe_isdbt.layers[1].time_interleaving = htsmsg_get_u32_or_default(l, "ISDBT_LAYERB_TIME_INTERLEAVING", 0);
+     mux->u.dmc_fe_isdbt.layers[2].time_interleaving = htsmsg_get_u32_or_default(l, "ISDBT_LAYERC_TIME_INTERLEAVING", 0);
+ 
++  } else if (mux->dmc_fe_delsys == DVB_SYS_ISDBS) {
++
++    /* The tvheadend ISDB-S mux class exposes only frequency + stream_id +
++     * delsys, but the linuxdvb tune path reads POLARISATION + SYMBOL_RATE
++     * out of the qpsk union to drive DTV_VOLTAGE / DTV_SYMBOL_RATE on the
++     * DVB API, so we parse them too. They are optional here; the px4
++     * backend ignores them, but Japan's BS/CS seedfile ships
++     * POLARIZATION = R + SYMBOL_RATE = 28860000 for the linuxdvb path.
++     * STREAM_ID is the BS slot (0-7) — plain numeric, not the PLS-packed
++     * form DVB-S2 uses above. */
++    if ((x = htsmsg_get_str(l, "INVERSION")))
++      if ((mux->dmc_fe_inversion = dvb_str2inver(x)) == -1)
++        mux_fail(r, "wrong inversion '%s'", x);
++    if (htsmsg_get_s32(l, "STREAM_ID", &mux->dmc_fe_stream_id))
++      mux->dmc_fe_stream_id = DVB_NO_STREAM_ID_FILTER;
++    if ((x = htsmsg_get_str(l, "POLARIZATION"))) {
++      char pol[2];
++      pol[0] = x[0]; pol[1] = '\0';
++      if ((mux->u.dmc_fe_qpsk.polarisation = dvb_str2pol(pol)) == -1)
++        mux_fail(r, "wrong polarisation '%s'", x);
++    }
++    htsmsg_get_u32(l, "SYMBOL_RATE", &mux->u.dmc_fe_qpsk.symbol_rate);
++
+   } else {
+ 
+     mux_fail(r, "wrong delivery system '%s'", x);
