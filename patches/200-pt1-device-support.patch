@@ -1,0 +1,1537 @@
+--- a/Makefile
++++ b/Makefile
+@@ -439,6 +439,13 @@ SRCS-LINUXDVB = \
+ SRCS-${CONFIG_LINUXDVB} += $(SRCS-LINUXDVB)
+ I18N-C += $(SRCS-LINUXDVB)
+ 
++# PT-series chardev tuners (Earthsoft PT1/PT2/PT3 / PLEX PX-family)
++SRCS-PT1 = \
++	src/input/mpegts/pt1/pt1.c \
++	src/input/mpegts/pt1/pt1_dev.c
++SRCS-${CONFIG_PT1} += $(SRCS-PT1)
++I18N-C += $(SRCS-PT1)
++
+ # SATIP Client
+ SRCS-SATIP-CLIENT = \
+ 	src/input/mpegts/satip/satip.c \
+--- a/configure
++++ b/configure
+@@ -25,6 +25,7 @@ OPTIONS=(
+   "capmt:yes"
+   "constcw:yes"
+   "linuxdvb:yes"
++  "pt1:auto"
+   "satip_server:yes"
+   "satip_client:yes"
+   "hdhomerun_client:no"
+@@ -463,6 +464,13 @@ if enabled_or_auto linuxdvb; then
+   fi
+ fi
+ 
++#
++# PT-series chardev tuners (no pkg-config dependency)
++#
++if enabled_or_auto pt1; then
++  enable pt1
++fi
++
+ if enabled linuxdvb; then
+   if enabled_or_auto ddci; then
+     enable ddci
+--- a/src/input.h
++++ b/src/input.h
+@@ -177,6 +177,9 @@ void tvh_input_instance_clear_stats ( tv
+ #if ENABLE_LINUXDVB
+ #include "input/mpegts/linuxdvb.h"
+ #endif
++#if ENABLE_PT1
++#include "input/mpegts/pt1.h"
++#endif
+ #if ENABLE_SATIP_CLIENT
+ #include "input/mpegts/satip/satip.h"
+ #endif
+--- a/src/input/mpegts.c
++++ b/src/input/mpegts.c
+@@ -73,6 +73,11 @@ mpegts_init ( int linuxdvb_mask, int nos
+   linuxdvb_init(linuxdvb_mask);
+ #endif
+ 
++  /* PT-series chardev tuners */
++#if ENABLE_PT1
++  pt1_init();
++#endif
++
+   /* SAT>IP DVB client */
+ #if ENABLE_SATIP_CLIENT
+   satip_init(nosatip, satip_client);
+@@ -104,6 +109,9 @@ mpegts_done ( void )
+ #if ENABLE_LINUXDVB
+   tvhftrace(LS_MAIN, linuxdvb_done);
+ #endif
++#if ENABLE_PT1
++  tvhftrace(LS_MAIN, pt1_done);
++#endif
+ #if ENABLE_SATIP_CLIENT
+   tvhftrace(LS_MAIN, satip_done);
+ #endif
+--- /dev/null
++++ b/src/input/mpegts/pt1.h
+@@ -0,0 +1,35 @@
++/*
++ *  Tvheadend - Linux DVB input system
++ *
++ *  Copyright (C) 2013 Adam Sutton
++ *
++ *  This program is free software: you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation, either version 3 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef __TVH_PT1_H__
++#define __TVH_PT1_H__
++
++void pt1_init ( void );
++
++void pt1_done ( void );
++
++idnode_set_t *pt1_root ( void );
++
++#endif /* __TVH_PT1_H__ */
++
++/******************************************************************************
++ * Editor Configuration
++ *
++ * vim:sts=2:ts=2:sw=2:et
++ *****************************************************************************/
+--- /dev/null
++++ b/src/input/mpegts/pt1/pt1.c
+@@ -0,0 +1,1008 @@
++#include "tvheadend.h"
++#include "input.h"
++#include "settings.h"
++#include "fsmonitor.h"
++#include "pt1_dev.h"
++#include "pt1_ioctl.h"
++#include "tvhpoll.h"
++
++#include <sys/types.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <fcntl.h>
++#include <openssl/sha.h>
++#include <math.h>
++
++#define MAX_DEV_OPEN_ATTEMPTS 20
++
++typedef struct pt1_adapter     pt1_adapter_t;
++typedef struct pt1_frontend     pt1_frontend_t;
++
++struct pt1_adapter
++{
++  tvh_hardware_t;
++
++  /*
++   * Adapter info
++   */
++  char    *pt_name;
++  char    *pt_rootpath;
++  pt1_frontend_t *pt_frontend;
++};
++
++struct pt1_frontend
++{
++  mpegts_input_t;
++  pt1_adapter_t *pfe_adapter;
++  dvb_fe_type_t pfe_type;
++  volatile int pfe_fd;
++
++  uint32_t pfe_thread_started;
++  volatile uint32_t pfe_thread_running;
++  pthread_t                 pfe_dvr_thread;
++  tvh_mutex_t           pfe_dvr_lock;
++  tvh_cond_t                pfe_dvr_cond;
++  volatile int32_t pfe_dvr_error;
++
++  uint32_t                  pfe_skip_bytes;
++  uint32_t                  pfe_ibuf_size;
++
++  int64_t                   pfe_monitor;
++  mtimer_t                  pfe_monitor_timer;
++
++  uint32_t pfe_ready;
++  volatile uint32_t pfe_in_setup;
++  uint32_t pfe_locked;
++
++  uint32_t pfe_status_period;
++
++  int pfe_lnb_voltage;
++};
++
++
++static void
++pt1_frontend_save ( pt1_frontend_t *lfe, htsmsg_t *fe )
++{
++  char id[16];
++  htsmsg_t *m = htsmsg_create_map();
++
++  /* Save frontend */
++  mpegts_input_save((mpegts_input_t*)lfe, m);
++  htsmsg_add_s32(m, "type", lfe->pfe_type);
++  htsmsg_add_uuid(m, "uuid", &lfe->ti_id.in_uuid);
++
++  /* Add to list */
++  snprintf(id, sizeof(id), "Frontend %d", lfe->pfe_type);
++  htsmsg_add_msg(fe, id, m);
++}
++
++
++static htsmsg_t *
++pt1_adapter_class_save ( idnode_t *in, char *filename, size_t fsize )
++{
++  pt1_adapter_t *la = (pt1_adapter_t*)in;
++  htsmsg_t *m, *l;
++
++  char ubuf[UUID_HEX_SIZE];
++
++  m = htsmsg_create_map();
++  idnode_save(&la->th_id, m);
++
++  if (filename) {
++    /* Frontends */
++    l = htsmsg_create_map();
++    pt1_frontend_save(la->pt_frontend, l);
++    htsmsg_add_msg(m, "frontends", l);
++
++    /* Filename */
++    snprintf(filename, fsize, "input/pt1/adapters/%s",
++             idnode_uuid_as_str(&la->th_id, ubuf));
++  }
++  return m;
++}
++
++
++static void
++pt1_adapter_class_get_title
++  ( idnode_t *in, const char *lang, char *dst, size_t dstsize )
++{
++  pt1_adapter_t *la = (pt1_adapter_t*)in;
++  snprintf(dst, dstsize, "%s", la->pt_rootpath);
++}
++
++static const void *
++pt1_adapter_class_active_get ( void *obj )
++{
++  pt1_adapter_t *la = (pt1_adapter_t*)obj;
++  static int active = 0;
++  active = la->pt_frontend->mi_is_enabled((mpegts_input_t*)la->pt_frontend, NULL, 0, -1) != MI_IS_ENABLED_NEVER;
++  return &active;
++}
++
++static idnode_set_t *
++pt1_adapter_class_get_childs ( idnode_t *in )
++{
++  pt1_adapter_t *la = (pt1_adapter_t*)in;
++  idnode_set_t *is = idnode_set_create(0);
++  idnode_set_add(is, &la->pt_frontend->ti_id, NULL, NULL);
++  return is;
++}
++
++const idclass_t pt1_adapter_class =
++{
++  .ic_class      = "pt1_adapter",
++  .ic_caption    = N_("pt1 adapter"),
++  .ic_event      = "pt1_adapter",
++  .ic_save       = pt1_adapter_class_save,
++  .ic_get_childs = pt1_adapter_class_get_childs,
++  .ic_get_title  = pt1_adapter_class_get_title,
++  .ic_properties = (const property_t[]){
++    {
++      .type     = PT_BOOL,
++      .id       = "active",
++      .name     = N_("Active"),
++      .opts     = PO_RDONLY | PO_NOSAVE | PO_NOUI,
++      .get	= pt1_adapter_class_active_get,
++    },
++    {
++      .type     = PT_STR,
++      .id       = "rootpath",
++      .name     = N_("Device path"),
++      .desc     = N_("Path used by the device."),
++      .opts     = PO_RDONLY,
++      .off      = offsetof(pt1_adapter_t, pt_rootpath),
++    },
++    {}
++  }
++};
++
++
++static inline void pt1_adapter_changed ( pt1_adapter_t *pa )
++  { idnode_changed(&pa->th_id); }
++
++
++static void
++pt1_frontend_class_changed ( idnode_t *in )
++{
++  pt1_adapter_t *la = ((pt1_frontend_t*)in)->pfe_adapter;
++  pt1_adapter_changed(la);
++}
++
++
++const idclass_t pt1_frontend_class =
++{
++  .ic_super      = &mpegts_input_class,
++  .ic_class      = "pt1_frontend",
++  .ic_caption    = N_("PT1 frontend"),
++  //.ic_doc        = tvh_doc_pt1_frontend_class,
++  .ic_changed    = pt1_frontend_class_changed,
++  .ic_properties = (const property_t[]) {
++    {
++      .type     = PT_U32,
++      .id       = "skip_bytes",
++      .name     = N_("Skip initial bytes"),
++      .desc     = N_("If set, the first bytes from the MPEG-TS stream "
++                     "are discarded. It may be required for some "
++                     "drivers or hardware which do not flush the MPEG-TS "
++                      "buffers completely after a frequency/parameter change."),
++      .opts     = PO_ADVANCED,
++      .off      = offsetof(pt1_frontend_t, pfe_skip_bytes),
++    },
++    {
++      .type     = PT_U32,
++      .id       = "ibuf_size",
++      .name     = N_("Input buffer (bytes)"),
++      .desc     = N_("The number of bytes to buffer. By default, "
++                     "linuxdvb's input buffer is 18800 bytes long. The "
++                     "accepted range is 18800-1880000 bytes."),
++      .opts     = PO_ADVANCED,
++      .off      = offsetof(pt1_frontend_t, pfe_ibuf_size),
++    },
++    {
++      .type     = PT_U32,
++      .id       = "status_period",
++      .name     = N_("Status period (ms)"),
++      .desc     = N_("By default, linuxdvb's status read period is "
++                     "1000ms (one second). The accepted range is 250ms "
++                     "to 8000ms. Note that for some hardware or drivers "
++                     "(like USB), the status operations take too much "
++                     "time and CPU. In this case, increase the default "
++                     "value. For fast hardware, this value might be "
++                     "decreased to make the decision of the re-tune "
++                     "algorithm based on the signal status faster."),
++      .opts     = PO_ADVANCED,
++      .off      = offsetof(pt1_frontend_t, pfe_status_period),
++    },
++    {}
++  }
++};
++
++const idclass_t pt1_frontend_isdb_t_class =
++{
++  .ic_super      = &pt1_frontend_class,
++  .ic_class      = "pt1_frontend_isdb_t",
++//  .ic_doc        = tvh_doc_pt1_frontend_dvbt_class,
++  .ic_caption    = N_("TV Adapters - Linux ISDB-T Frontend"),
++  .ic_properties = (const property_t[]){
++    {}
++  }
++};
++
++const idclass_t pt1_frontend_isdb_s_class =
++{
++  .ic_super      = &pt1_frontend_class,
++  .ic_class      = "pt1_frontend_isdb_s",
++//  .ic_doc        = tvh_doc_pt1_frontend_dvbt_class,
++  .ic_caption    = N_("TV Adapters - Linux ISDB-S Frontend"),
++  .ic_properties = (const property_t[]){
++    {
++      .type     = PT_U32,
++      .id       = "lnb_voltage",
++      .name     = N_("LNB Voltage"),
++      .desc     = N_("lnb_voltage"),
++      .opts     = PO_ADVANCED,
++      .off      = offsetof(pt1_frontend_t, pfe_lnb_voltage),
++    },
++    {}
++  }
++};
++
++
++static void
++pt1_frontend_close_fd ( pt1_frontend_t *lfe, const char *name )
++{
++  char buf[256];
++  int fd = atomic_exchange(&lfe->pfe_fd, -1);
++  if (fd <= 0)
++    return;
++
++  if (name == NULL) {
++    lfe->mi_display_name((mpegts_input_t *)lfe, buf, sizeof(buf));
++    name = buf;
++  }
++
++  tvhtrace(LS_PT1, "%s - closing FE %s",
++           name, lfe->pfe_adapter->pt_rootpath);
++  close(fd);
++}
++
++static int
++pt1_frontend_open_fd ( pt1_frontend_t *lfe, const char *name )
++{
++  if (lfe->pfe_fd > 0)
++    return lfe->pfe_fd;
++
++  int fd = tvh_open(lfe->pfe_adapter->pt_rootpath, O_RDONLY/* | O_NONBLOCK*/, 0);
++  if (fd <= 0)
++    return fd;
++
++  int oldfd = atomic_exchange(&lfe->pfe_fd, fd);
++  if (oldfd > 0)
++    close(oldfd);
++
++  tvhtrace(LS_PT1, "%s - opening FE %s (%d)",
++           name, lfe->pfe_adapter->pt_rootpath, fd);
++
++  return lfe->pfe_fd;
++}
++
++
++static void
++pt1_frontend_enabled_updated ( mpegts_input_t *mi )
++{
++  char buf[512];
++  pt1_frontend_t *lfe = (pt1_frontend_t*)mi;
++
++  mi->mi_display_name(mi, buf, sizeof(buf));
++
++  /* Ensure disabled */
++  if (!mi->mi_enabled) {
++    tvhtrace(LS_PT1, "%s - disabling tuner", buf);
++    pt1_frontend_close_fd(lfe, buf);
++    mtimer_disarm(&lfe->pfe_monitor_timer);
++
++  /* Ensure FE opened (if not powersave) */
++  }
++}
++
++static const idclass_t*
++pt1_get_id_class_by_type(dvb_fe_type_t type)
++{
++    if (type == DVB_TYPE_ISDB_T)
++        return &pt1_frontend_isdb_t_class;
++    else if (type == DVB_TYPE_ISDB_S)
++        return &pt1_frontend_isdb_s_class;
++    else
++        return NULL;
++}
++
++static mpegts_network_t *
++pt1_frontend_wizard_network ( pt1_frontend_t *lfe )
++{
++  return (mpegts_network_t *)LIST_FIRST(&lfe->mi_networks);
++}
++
++static htsmsg_t *
++pt1_frontend_wizard_get( tvh_input_t *ti, const char *lang )
++{
++  pt1_frontend_t *lfe = (pt1_frontend_t*)ti;
++  mpegts_network_t *mn;
++  const idclass_t *idc = NULL;
++
++  mn = pt1_frontend_wizard_network(lfe);
++  if ((mn == NULL) || (mn && mn->mn_wizard)) {
++    idc = pt1_get_id_class_by_type(lfe->pfe_type);
++  }
++  return mpegts_network_wizard_get((mpegts_input_t *)lfe, idc, mn, lang);
++}
++
++static void
++pt1_frontend_wizard_set( tvh_input_t *ti, htsmsg_t *conf, const char *lang )
++{
++  pt1_frontend_t *lfe = (pt1_frontend_t*)ti;
++  const char *ntype = htsmsg_get_str(conf, "mpegts_network_type");
++  mpegts_network_t *mn;
++  htsmsg_t *nlist;
++
++  if (LIST_FIRST(&lfe->mi_mux_active))
++    return;
++  mpegts_network_wizard_create(ntype, &nlist, lang);
++  mn = pt1_frontend_wizard_network(lfe);
++  if (ntype && (mn == NULL || mn->mn_wizard)) {
++    mpegts_input_set_networks((mpegts_input_t *)lfe, nlist);
++    htsmsg_destroy(nlist);
++
++    if (pt1_frontend_wizard_network(lfe))
++      mpegts_input_set_enabled((mpegts_input_t *)lfe, 1);
++    pt1_adapter_changed(lfe->pfe_adapter);
++  } else {
++    htsmsg_destroy(nlist);
++  }
++}
++
++static idnode_set_t *
++pt1_frontend_network_list ( mpegts_input_t *mi )
++{
++  pt1_frontend_t *lfe = (pt1_frontend_t*)mi;
++
++  tvhtrace(LS_PT1, "%s: network list for %d",
++           mi->mi_name ?: "", lfe->pfe_type);
++
++  const idclass_t *idc = NULL;
++  idc = dvb_network_class_by_fe_type(lfe->pfe_type);
++  if (idc == NULL) return NULL;
++
++  return idnode_find_all(idc, NULL);
++}
++
++static void *
++pt1_frontend_input_thread ( void *aux )
++{
++  pt1_frontend_t *lfe = aux;
++  mpegts_mux_instance_t *mmi;
++  char name[256];//, b;
++  //tvhpoll_event_t ev[2];
++  //tvhpoll_t *efd;
++  ssize_t n;
++  size_t skip = (MIN(lfe->pfe_skip_bytes, 1024*1024) / 188) * 188;
++  size_t counter = 0;
++  sbuf_t sb;
++  int dvr = -1;//, nfds;//, nodata = 4;
++
++  /* Get MMI */
++  tvh_mutex_lock(&lfe->pfe_dvr_lock);
++  lfe->mi_display_name((mpegts_input_t*)lfe, name, sizeof(name));
++  mmi = LIST_FIRST(&lfe->mi_mux_active);
++  tvh_cond_signal(&lfe->pfe_dvr_cond, 0);
++  tvh_mutex_unlock(&lfe->pfe_dvr_lock);
++
++  if (mmi == NULL) {
++    lfe->pfe_dvr_error = SM_CODE_TUNING_FAILED;
++    tvherror(LS_PT1, "%s mmi NULL", name);
++    return NULL;
++  }
++  
++  dvr = pt1_frontend_open_fd(lfe, name);
++  if (dvr <= 0) {
++    lfe->pfe_dvr_error = SM_CODE_TUNING_FAILED;
++    return NULL;
++  }
++
++  if ((ioctl(dvr, STOP_REC, NULL)) != 0 &&
++    errno != EALREADY) {
++    lfe->pfe_dvr_error = SM_CODE_TUNING_FAILED;
++    tvherror(LS_PT1, "%s - STOP_REC failed [e=%s]", name, strerror(errno));
++    pt1_frontend_close_fd(lfe, name);
++    return NULL;
++  }
++
++  uint32_t feFreq = ((dvb_mux_t*)mmi->mmi_mux)->lm_tuning.dmc_fe_freq;
++  tvhtrace(LS_PT1, "tuner %s tuning to (freq %i)", name, feFreq);
++
++  if (ioctl(dvr, PTX_SET_SYSTEM_MODE, lfe->pfe_type == DVB_TYPE_ISDB_T ? 16 : 32) != 0)
++  {
++    lfe->pfe_dvr_error = SM_CODE_TUNING_FAILED;
++    tvherror(LS_PT1, "%s - PTX_SET_SYSTEM_MODE failed %s", name, strerror(errno));
++    pt1_frontend_close_fd(lfe, name);
++    return NULL;
++  }
++
++  FREQUENCY freq;
++  {
++    dvb_mux_t *dm = (dvb_mux_t*)mmi->mmi_mux;
++    if (pt1_resolve_freq(dm->lm_tuning.dmc_fe_freq,
++                         dm->lm_tuning.dmc_fe_stream_id,
++                         lfe->pfe_type, &freq) != 0) {
++      lfe->pfe_dvr_error = SM_CODE_TUNING_FAILED;
++      tvherror(LS_PT1, "%s - invalid channel", name);
++      pt1_frontend_close_fd(lfe, name);
++      return NULL;
++    }
++  }
++
++  if (lfe->pfe_type == DVB_TYPE_ISDB_S) {
++    int value = lfe->pfe_lnb_voltage;
++    tvhtrace(LS_PT1, "%s - LNB_ENABLE %d", name, value);
++    if(ioctl(dvr, LNB_ENABLE, value) != 0) {
++      tvherror(LS_PT1, "%s - LNB_ENABLE failed [e=%s]", name, strerror(errno));
++      lfe->pfe_dvr_error = SM_CODE_TUNING_FAILED;
++      pt1_frontend_close_fd(lfe, name);
++      return NULL;
++    }
++  }
++
++  tvhtrace(LS_PT1, "%s - tuning fno=%d slot=%d", name, freq.frequencyno, freq.slot);
++  if (ioctl(lfe->pfe_fd, SET_CHANNEL, &freq) != 0)
++  {
++    tvherror(LS_PT1, "%s - SET_CHANNEL failed [e=%s]", name, strerror(errno));
++    if (errno != EAGAIN) {
++      lfe->pfe_dvr_error = SM_CODE_TUNING_FAILED;
++      pt1_frontend_close_fd(lfe, name);
++      return NULL;
++    }
++  }
++
++  if ((ioctl(dvr, START_REC, NULL)) != 0) {
++    lfe->pfe_dvr_error = SM_CODE_TUNING_FAILED;
++    tvherror(LS_PT1, "%s - START_REC failed [e=%s]", name, strerror(errno));
++    pt1_frontend_close_fd(lfe, name);
++    return NULL;
++  }
++
++  /* Allocate memory */
++  sbuf_init_fixed(&sb, MINMAX(lfe->pfe_ibuf_size, 18800, 1880000));
++  
++  lfe->pfe_in_setup = 0;
++
++  tvhtrace(LS_PT1, "start!");
++  
++  /* Read */
++  while (tvheadend_is_running() && lfe->pfe_thread_running) {    
++    /* Read */
++    if ((n = sbuf_read(&sb, dvr)) < 0) {
++      if (ERRNO_AGAIN(errno))
++        continue;
++      if (errno == EOVERFLOW) {
++        tvhwarn(LS_PT1, "%s - read() EOVERFLOW", name);
++        continue;
++      }
++      tvherror(LS_PT1, "%s - read() error %d (%s)",
++               name, errno, strerror(errno));
++      break;
++    }
++
++    /* Skip the initial bytes */
++    if (counter < skip) {
++      counter += n;
++      if (counter < skip) {
++        sbuf_cut(&sb, n);
++      } else {
++        sbuf_cut(&sb, skip - (counter - n));
++      }
++    }
++    
++    /* Process */
++    mpegts_input_recv_packets(mmi, &sb, 0, NULL);
++  }
++  
++  sbuf_free(&sb);
++  lfe->pfe_dvr_error = SM_CODE_ABORTED;
++  pt1_frontend_close_fd(lfe, name);
++  return NULL;
++}
++
++
++
++static void
++pt1_frontend_monitor ( void *aux )
++{
++  char buf[256];
++  pt1_frontend_t *lfe = aux;
++  mpegts_mux_instance_t *mmi = LIST_FIRST(&lfe->mi_mux_active);
++  mpegts_mux_t *mm;
++  signal_status_t sigstat;
++  streaming_message_t sm;
++  service_t *s;
++  int e;
++  uint32_t period = MINMAX(lfe->pfe_status_period, 250, 8000);
++  signal_status_scale_t snr_scale = SIGNAL_STATUS_SCALE_UNKNOWN;
++  int snr = 0;
++  int dvr = -1;
++
++  lfe->mi_display_name((mpegts_input_t*)lfe, buf, sizeof(buf));
++  tvhtrace(LS_PT1, "%s - checking FE status %d/%d/%d error:%d", buf, lfe->mi_enabled, lfe->pfe_ready, lfe->pfe_locked, lfe->pfe_dvr_error);
++  
++  /* Disabled */
++  if (!lfe->mi_enabled && mmi)
++    mmi->mmi_mux->mm_stop(mmi->mmi_mux, 1, SM_CODE_ABORTED);
++  //else if(lfe->pfe_dvr_error && mmi)
++  //  mmi->mmi_mux->mm_stop(mmi->mmi_mux, 1, lfe->pfe_dvr_error);
++
++  /* Stop timer */
++  if (!mmi || !lfe->pfe_ready) return;
++
++  /* re-arm */
++  mtimer_arm_rel(&lfe->pfe_monitor_timer, pt1_frontend_monitor, lfe, ms2mono(period));
++
++  /* Get current mux */
++  mm = mmi->mmi_mux;
++
++  /* Waiting for lock */
++  if (!lfe->pfe_locked) {
++    lfe->pfe_locked = 1;
++
++    tvh_mutex_lock(&lfe->pfe_dvr_lock);
++    if (lfe->pfe_thread_started == 0)
++    {
++      lfe->pfe_dvr_error = 0;
++      lfe->pfe_thread_started = 1;
++      lfe->pfe_thread_running = 1;
++      tvh_thread_create(&lfe->pfe_dvr_thread, NULL,
++                        pt1_frontend_input_thread, lfe, "lnxdvb-front");
++      do {
++        e = tvh_cond_wait(&lfe->pfe_dvr_cond, &lfe->pfe_dvr_lock);
++        if (e == ETIMEDOUT)
++          break;
++      } while (ERRNO_AGAIN(e));
++    }
++    else
++    {
++      tvherror(LS_PT1, "pfe_thread_started already?");
++    }
++    tvh_mutex_unlock(&lfe->pfe_dvr_lock);
++
++    /* Table handlers */
++    psi_tables_install((mpegts_input_t *)lfe, mm,
++                        ((dvb_mux_t *)mm)->lm_tuning.dmc_fe_delsys);
++  } else {
++    if (mclk() < lfe->pfe_monitor)
++      return;
++    lfe->pfe_monitor = mclk() + ms2mono(period);
++  }
++
++  dvr = lfe->pfe_fd;
++  if (dvr > 0 && !lfe->pfe_dvr_error) {
++    if (ioctl(dvr, GET_SIGNAL_STRENGTH, &snr) != 0) {
++      tvherror(LS_PT1, "%s - GET_SIGNAL_STRENGTH failed [e=%s]", buf, strerror(errno));
++    } else if (lfe->pfe_type == DVB_TYPE_ISDB_S) {
++      // TODO
++      snr_scale = SIGNAL_STATUS_SCALE_DECIBEL;
++    } else {
++      snr_scale = SIGNAL_STATUS_SCALE_DECIBEL;
++      double P = log10(5505024/(double)snr) * 10;
++      double CNR = (0.000024 * P * P * P * P) - (0.0016 * P * P * P) +
++                    (0.0398 * P * P) + (0.5491 * P)+3.0965;
++      snr = CNR * 1000;
++    }
++  }
++
++
++  tvh_mutex_lock(&mmi->tii_stats_mutex);
++  mmi->tii_stats.signal_scale = SIGNAL_STATUS_SCALE_UNKNOWN;
++  mmi->tii_stats.signal = 0;
++  mmi->tii_stats.ec_bit = 0;
++  mmi->tii_stats.tc_bit = 0;
++  mmi->tii_stats.snr_scale = snr_scale;
++  mmi->tii_stats.snr = snr;
++  mmi->tii_stats.tc_block = 0;
++
++  /* Send message */
++  sigstat.status_text  = "UNKNOWN";
++  sigstat.snr          = mmi->tii_stats.snr;
++  sigstat.signal       = mmi->tii_stats.signal;
++  sigstat.ber          = mmi->tii_stats.ber;
++  sigstat.unc          = atomic_get(&mmi->tii_stats.unc);
++  sigstat.signal_scale = mmi->tii_stats.signal_scale;
++  sigstat.snr_scale    = mmi->tii_stats.snr_scale;
++  sigstat.ec_bit       = mmi->tii_stats.ec_bit;
++  sigstat.tc_bit       = mmi->tii_stats.tc_bit;
++  sigstat.ec_block     = mmi->tii_stats.ec_block;
++  sigstat.tc_block     = mmi->tii_stats.tc_block;
++  memset(&sm, 0, sizeof(sm));
++  sm.sm_type = SMT_SIGNAL_STATUS;
++  sm.sm_data = &sigstat;
++
++  tvh_mutex_unlock(&mmi->tii_stats_mutex);
++
++  LIST_FOREACH(s, &mmi->mmi_mux->mm_transports, s_active_link) {
++    tvh_mutex_lock(&s->s_stream_mutex);
++    streaming_service_deliver(s, streaming_msg_clone(&sm));
++    tvh_mutex_unlock(&s->s_stream_mutex);
++  }
++}
++
++
++static int
++pt1_frontend_start_mux
++  ( mpegts_input_t *mi, mpegts_mux_instance_t *mmi, int weight )
++{
++  pt1_frontend_t *lfe = (pt1_frontend_t*)mi;
++  char buf1[256];
++
++  lfe->mi_display_name((mpegts_input_t*)lfe, buf1, sizeof(buf1));
++  {
++    dvb_mux_t *dm = (dvb_mux_t*)mmi->mmi_mux;
++    FREQUENCY probe;
++    if (pt1_resolve_freq(dm->lm_tuning.dmc_fe_freq,
++                         dm->lm_tuning.dmc_fe_stream_id,
++                         lfe->pfe_type, &probe) != 0) {
++      tvherror(LS_PT1, "%s - invalid freq: %s", buf1, mmi->mmi_mux->mm_nicename);
++      return SM_CODE_TUNING_FAILED;
++    }
++  }
++
++  tvhdebug(LS_PT1, "%s - starting %s", buf1, mmi->mmi_mux->mm_nicename);
++
++  lfe->pfe_ready = 1;
++  lfe->pfe_in_setup = 1;
++  lfe->pfe_monitor = mclk() + sec2mono(4);
++  mtimer_arm_rel(&lfe->pfe_monitor_timer, pt1_frontend_monitor, lfe, ms2mono(50));
++  return 0;
++}
++
++
++static void
++pt1_frontend_stop_mux
++  ( mpegts_input_t *mi, mpegts_mux_instance_t *mmi )
++{
++  char buf1[256];
++  pt1_frontend_t *lfe = (pt1_frontend_t*)mi;
++
++  mi->mi_display_name(mi, buf1, sizeof(buf1));
++  tvhdebug(LS_PT1, "%s - stopping %s", buf1, mmi->mmi_mux->mm_nicename);
++
++  /* Stop thread */
++  if (lfe->pfe_thread_started) {
++    lfe->pfe_thread_running = 0;
++    tvhtrace(LS_PT1, "%s - waiting for dvr thread", buf1);
++    pthread_join(lfe->pfe_dvr_thread, NULL);
++    lfe->pfe_thread_started = 0;
++    tvhdebug(LS_PT1, "%s - stopped dvr thread", buf1);
++  }
++
++  lfe->pfe_dvr_error = 0;
++  lfe->pfe_locked = 0;
++  lfe->pfe_ready = 0;
++  lfe->pfe_in_setup = 0;
++
++  mtimer_arm_rel(&lfe->pfe_monitor_timer, pt1_frontend_monitor, lfe, sec2mono(2));
++}
++
++
++static int
++pt1_frontend_is_enabled
++  ( mpegts_input_t *mi, mpegts_mux_t *mm, int flags, int weight )
++{
++  pt1_frontend_t *lfe = (pt1_frontend_t*)mi;
++  int w;
++
++  w = mpegts_input_is_enabled(mi, mm, flags, weight);
++  if (w != MI_IS_ENABLED_OK)
++    return w;
++  if (mm == NULL)
++    return MI_IS_ENABLED_OK;
++  if (lfe->pfe_in_setup)
++    return MI_IS_ENABLED_RETRY;
++
++  return MI_IS_ENABLED_OK;
++}
++
++
++static pt1_frontend_t *
++pt1_frontend_create
++  ( htsmsg_t *conf, pt1_adapter_t *la, dvb_fe_type_t type )
++{
++  const idclass_t *idc;
++  const char *uuid = NULL;
++  char id[16];
++  pt1_frontend_t *lfe;
++
++  /* Internal config ID */
++  snprintf(id, sizeof(id), "Frontend %d", type);
++  if (conf)
++    conf = htsmsg_get_map(conf, id);
++  if (conf)
++    uuid = htsmsg_get_str(conf, "uuid");
++
++  /* Class */
++  idc = pt1_get_id_class_by_type(type);
++  if (idc == NULL)
++  {
++    tvherror(LS_PT1, "unknown FE type %d", type);
++    return NULL;
++  }
++
++  /* Create */
++  // Note: there is a bit of a chicken/egg issue below, without the
++  //       correct "fe_type" we cannot set the network (which is done
++  //       in mpegts_input_create()). So we must set early.
++  lfe = calloc(1, sizeof(pt1_frontend_t));
++  lfe->pfe_type = type;
++  lfe->pfe_fd = -1;
++  lfe = (pt1_frontend_t*)mpegts_input_create0((mpegts_input_t*)lfe, idc, uuid, conf);
++  if (!lfe) return NULL;
++
++  /* Default name */
++  if (!lfe->mi_name) {
++    lfe->mi_name = strdup(la->pt_rootpath);
++  }
++
++  /* Input callbacks */
++  lfe->ti_wizard_get          = pt1_frontend_wizard_get;
++  lfe->ti_wizard_set          = pt1_frontend_wizard_set;
++  lfe->mi_is_enabled          = pt1_frontend_is_enabled;
++  lfe->mi_start_mux           = pt1_frontend_start_mux;
++  lfe->mi_stop_mux            = pt1_frontend_stop_mux;
++  lfe->mi_network_list        = pt1_frontend_network_list;
++  lfe->mi_enabled_updated     = pt1_frontend_enabled_updated;
++  lfe->mi_empty_status        = mpegts_input_empty_status;
++
++  /* Adapter link */
++  lfe->pfe_adapter = la;
++
++  tvh_mutex_init(&lfe->pfe_dvr_lock, NULL);
++  tvh_cond_init(&lfe->pfe_dvr_cond, 1);
++
++  /* Double check enabled */
++  pt1_frontend_enabled_updated((mpegts_input_t*)lfe);
++
++  return lfe;
++}
++
++
++static pt1_adapter_t *
++pt1_adapter_create
++  ( const char *uuid, htsmsg_t *conf,
++    const char *path )
++{
++  pt1_adapter_t *la;
++
++  /* Create */
++  la = calloc(1, sizeof(pt1_adapter_t));
++  if (!tvh_hardware_create0((tvh_hardware_t*)la, &pt1_adapter_class,
++                            uuid, conf)) {
++    /* Note: la variable is freed in tvh_hardware_create0() */
++    return NULL;
++  }
++
++  free(la->pt_rootpath);
++  la->pt_rootpath   = strdup(path);
++  la->pt_name       = strdup(path);
++  la->pt_frontend   = NULL;
++
++  /* Callbacks */
++  //la->la_is_enabled = linuxdvb_adapter_is_enabled;
++
++  return la;
++}
++
++static pt1_adapter_t *
++pt1_adapter_new(const char *path, htsmsg_t **conf, int *save)
++{
++  pt1_adapter_t *la;
++  SHA_CTX sha1;
++  uint8_t uuidbin[20];
++  char uhex[UUID_HEX_SIZE];
++
++  /* Create hash for adapter */
++  SHA1_Init(&sha1);
++  SHA1_Update(&sha1, (void*)path,     strlen(path));
++  SHA1_Final(uuidbin, &sha1);
++
++  bin2hex(uhex, sizeof(uhex), uuidbin, sizeof(uuidbin));
++
++  /* Load config */
++  *conf = hts_settings_load("input/pt1/adapters/%s", uhex);
++  if (*conf == NULL)
++    *save = 1;
++
++  /* Create */
++  if (!(la = pt1_adapter_create(uhex, *conf, path))) {
++    htsmsg_destroy(*conf);
++    *conf = NULL;
++    return NULL;
++  }
++
++  tvhinfo(LS_PT1, "adapter added %s", path);
++  return la;
++}
++
++static void
++pt1_adapter_add ( const char *path )
++{
++  pt1_adapter_t *la = NULL;
++  htsmsg_t *conf = NULL, *feconf = NULL;
++  int save = 0;
++  const pt1_dev_info_t* dev_info = NULL;
++
++  tvhtrace(LS_PT1, "scanning adapter %s", path);
++
++  dev_info = is_pt1_dev_path(path);
++  if (dev_info == NULL) return;
++
++  /* Note: some of the below can take a while, so we relinquish the lock
++   *       to stop us blocking everyhing else
++   */
++  tvh_mutex_unlock(&global_lock);
++
++  do {
++    /* Create/Find adapter */
++    tvh_mutex_lock(&global_lock);
++    la = pt1_adapter_new(path, &conf, &save);
++    if (la == NULL) {
++      tvherror(LS_PT1, "failed to create %s", path);
++      return; // Note: save to return here as global_lock is held
++    }
++    if (conf)
++      feconf = htsmsg_get_map(conf, "frontends");
++
++    la->pt_frontend = pt1_frontend_create(feconf, la, dev_info->type);
++    tvh_mutex_unlock(&global_lock);
++  } while(0);
++
++  /* Cleanup */
++  if (conf)
++    htsmsg_destroy(conf);
++
++  /* Relock before exit */
++  tvh_mutex_lock(&global_lock);
++
++  /* Adapter couldn't be opened; there's nothing to work with  */
++  if (!la)
++    return;
++
++  tvhtrace(LS_PT1, "adapter created %s", path);
++
++  /* Save configuration */
++  if (save && la)
++    pt1_adapter_changed(la);
++}
++
++
++static void
++pt1_frontend_destroy ( pt1_frontend_t *lfe )
++{
++  lock_assert(&global_lock);
++
++  /* Ensure we're stopped */
++  mpegts_input_stop_all((mpegts_input_t*)lfe);
++
++  /* Stop monitor */
++  mtimer_disarm(&lfe->pfe_monitor_timer);
++
++  /* Close FDs */
++  if (lfe->pfe_fd > 0)
++    close(lfe->pfe_fd);
++
++  /* Remove from adapter */
++  if (lfe->pfe_adapter) lfe->pfe_adapter->pt_frontend = NULL;
++
++  /* Finish */
++  mpegts_input_delete((mpegts_input_t*)lfe, 0);
++}
++
++static void
++pt1_adapter_del ( const char *path )
++{
++  pt1_adapter_t *la = NULL;
++  tvh_hardware_t *th;
++
++  LIST_FOREACH(th, &tvh_hardware, th_link)
++    if (idnode_is_instance(&th->th_id, &pt1_adapter_class)) {
++      la = (pt1_adapter_t*)th;
++      if (!strcmp(path, la->pt_rootpath))
++          break;
++    }
++  if (!th) return;
++
++  idnode_save_check(&la->th_id, 0);
++
++  if (la->pt_frontend) pt1_frontend_destroy(la->pt_frontend);
++
++  /* Free memory */
++  free(la->pt_rootpath);
++  free(la->pt_name);
++    
++  /* Delete */
++  tvh_hardware_delete((tvh_hardware_t*)la);
++
++  free(la);
++}
++
++static void
++devpt1_create ( fsmonitor_t *fsm, const char *path )
++{
++  if (is_pt1_dev_path(path) == NULL) {
++    return;
++  } 
++  pt1_adapter_add(path);
++}
++
++static void
++devpt1_delete ( fsmonitor_t *fsm, const char *path )
++{
++  if (is_pt1_dev_path(path) == NULL) {
++    return;
++  }
++  tvhinfo(LS_PT1, "adapter removed %s", path);
++  pt1_adapter_del(path);
++}
++
++static fsmonitor_t devmon = {
++  .fsm_create = devpt1_create,
++  .fsm_delete = devpt1_delete
++};
++
++
++
++
++static void
++pt1_adapter_scan ( void )
++{
++  DIR *dir;
++  struct dirent buf, *de;
++  char path[1024];
++
++  if ((dir = opendir("/dev"))) {
++    while (!readdir_r(dir, &buf, &de) && de) {
++      if (de->d_name[0] == '.') continue;
++      snprintf(path, sizeof(path), "/dev/%s", de->d_name);
++      if (is_pt1_dev_path(path) == NULL) continue;
++      pt1_adapter_add(path);
++    }
++    closedir(dir);
++  }
++}
++
++
++void pt1_init ( void )
++{
++  tvhtrace(LS_PT1, "pt1_init");
++  idclass_register(&pt1_adapter_class);
++  idclass_register(&pt1_frontend_isdb_t_class);
++  idclass_register(&pt1_frontend_isdb_s_class);
++
++  (void)fsmonitor_add("/dev", &devmon);
++  pt1_adapter_scan();
++}
++
++void pt1_done ( void )
++{
++  pt1_adapter_t *la;
++  tvh_hardware_t *th, *n;
++
++  tvh_mutex_lock(&global_lock);
++  fsmonitor_del("/dev", &devmon);
++  for (th = LIST_FIRST(&tvh_hardware); th != NULL; th = n) {
++    n = LIST_NEXT(th, th_link);
++    if (idnode_is_instance(&th->th_id, &pt1_adapter_class)) {
++      la = (pt1_adapter_t*)th;
++      pt1_adapter_del(la->pt_rootpath);
++    }
++  }
++
++  tvh_mutex_unlock(&global_lock);
++
++}
+--- /dev/null
++++ b/src/input/mpegts/pt1/pt1_dev.c
+@@ -0,0 +1,315 @@
++#include "tvheadend.h"
++#include "pt1_dev.h"
++
++
++static const pt1_dev_info_t devices[] = {
++    { "/dev/pt1video0", DVB_TYPE_ISDB_S },
++    { "/dev/pt1video1", DVB_TYPE_ISDB_S },
++    { "/dev/pt1video5", DVB_TYPE_ISDB_S },
++    { "/dev/pt1video4", DVB_TYPE_ISDB_S },
++    { "/dev/pt1video9", DVB_TYPE_ISDB_S },
++    { "/dev/pt1video8", DVB_TYPE_ISDB_S },
++    { "/dev/pt1video13", DVB_TYPE_ISDB_S },
++    { "/dev/pt1video12", DVB_TYPE_ISDB_S },
++    { "/dev/pt3video1", DVB_TYPE_ISDB_S },
++    { "/dev/pt3video0", DVB_TYPE_ISDB_S },
++    { "/dev/pt3video5", DVB_TYPE_ISDB_S },
++    { "/dev/pt3video4", DVB_TYPE_ISDB_S },
++    { "/dev/pt3video9", DVB_TYPE_ISDB_S },
++    { "/dev/pt3video8", DVB_TYPE_ISDB_S },
++    { "/dev/pt3video13", DVB_TYPE_ISDB_S },
++    { "/dev/pt3video12", DVB_TYPE_ISDB_S },
++    { "/dev/px4video0", DVB_TYPE_ISDB_S },
++    { "/dev/px4video1", DVB_TYPE_ISDB_S },
++    { "/dev/px4video4", DVB_TYPE_ISDB_S },
++    { "/dev/px4video5", DVB_TYPE_ISDB_S },
++    { "/dev/asv52201", DVB_TYPE_ISDB_S },
++    { "/dev/asv52200", DVB_TYPE_ISDB_S },
++    { "/dev/asv52205", DVB_TYPE_ISDB_S },
++    { "/dev/asv52204", DVB_TYPE_ISDB_S },
++    { "/dev/asv52209", DVB_TYPE_ISDB_S },
++    { "/dev/asv52208", DVB_TYPE_ISDB_S },
++    { "/dev/asv522013", DVB_TYPE_ISDB_S },
++    { "/dev/asv522012", DVB_TYPE_ISDB_S },
++    { "/dev/pxq3pe0", DVB_TYPE_ISDB_S },
++    { "/dev/pxq3pe1", DVB_TYPE_ISDB_S },
++    { "/dev/pxq3pe4", DVB_TYPE_ISDB_S },
++    { "/dev/pxq3pe5", DVB_TYPE_ISDB_S },
++    { "/dev/pxq3pe8", DVB_TYPE_ISDB_S },
++    { "/dev/pxq3pe9", DVB_TYPE_ISDB_S },
++    { "/dev/pxq3pe12", DVB_TYPE_ISDB_S },
++    { "/dev/pxq3pe13", DVB_TYPE_ISDB_S },
++    { "/dev/pxw3u30",   DVB_TYPE_ISDB_S },
++    { "/dev/pxw3u32", DVB_TYPE_ISDB_S },
++    { "/dev/pxs3u20",   DVB_TYPE_ISDB_S },
++    { "/dev/pxs3u0",  DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV0", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV1", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV4", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV5", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV8", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV9", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV12", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV13", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV16", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV17", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV20", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV21", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV24", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV25", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV28", DVB_TYPE_ISDB_S },
++    { "/dev/px4-DTV29", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV0", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV1", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV2", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV3", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV4", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV5", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV6", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV7", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV8", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV9", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV10", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV11", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV12", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV13", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV14", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV15", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV16", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV17", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV18", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV19", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV20", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV21", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV22", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV23", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV24", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV25", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV26", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV27", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV28", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV29", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV30", DVB_TYPE_ISDB_S },
++    { "/dev/px5-DTV31", DVB_TYPE_ISDB_S },
++
++    { "/dev/pt1video2", DVB_TYPE_ISDB_T },
++    { "/dev/pt1video3", DVB_TYPE_ISDB_T },
++    { "/dev/pt1video6", DVB_TYPE_ISDB_T },
++    { "/dev/pt1video7", DVB_TYPE_ISDB_T },
++    { "/dev/pt1video10", DVB_TYPE_ISDB_T },
++    { "/dev/pt1video11", DVB_TYPE_ISDB_T },
++    { "/dev/pt1video14", DVB_TYPE_ISDB_T },
++    { "/dev/pt1video15", DVB_TYPE_ISDB_T },
++    { "/dev/pt3video2", DVB_TYPE_ISDB_T },
++    { "/dev/pt3video3", DVB_TYPE_ISDB_T },
++    { "/dev/pt3video6", DVB_TYPE_ISDB_T },
++    { "/dev/pt3video7", DVB_TYPE_ISDB_T },
++    { "/dev/pt3video10", DVB_TYPE_ISDB_T },
++    { "/dev/pt3video11", DVB_TYPE_ISDB_T },
++    { "/dev/pt3video14", DVB_TYPE_ISDB_T },
++    { "/dev/pt3video15", DVB_TYPE_ISDB_T },
++    { "/dev/px4video2", DVB_TYPE_ISDB_T },
++    { "/dev/px4video3", DVB_TYPE_ISDB_T },
++    { "/dev/px4video6", DVB_TYPE_ISDB_T },
++    { "/dev/px4video7", DVB_TYPE_ISDB_T },
++    { "/dev/asv52202", DVB_TYPE_ISDB_T },
++    { "/dev/asv52203", DVB_TYPE_ISDB_T },
++    { "/dev/asv52206", DVB_TYPE_ISDB_T },
++    { "/dev/asv52207", DVB_TYPE_ISDB_T },
++    { "/dev/asv522010", DVB_TYPE_ISDB_T },
++    { "/dev/asv522011", DVB_TYPE_ISDB_T },
++    { "/dev/asv522014", DVB_TYPE_ISDB_T },
++    { "/dev/asv522015", DVB_TYPE_ISDB_T },
++    { "/dev/pxq3pe2", DVB_TYPE_ISDB_T },
++    { "/dev/pxq3pe3", DVB_TYPE_ISDB_T },
++    { "/dev/pxq3pe6", DVB_TYPE_ISDB_T },
++    { "/dev/pxq3pe7", DVB_TYPE_ISDB_T },
++    { "/dev/pxq3pe10", DVB_TYPE_ISDB_T },
++    { "/dev/pxq3pe11", DVB_TYPE_ISDB_T },
++    { "/dev/pxq3pe14", DVB_TYPE_ISDB_T },
++    { "/dev/pxq3pe15", DVB_TYPE_ISDB_T },
++    { "/dev/pxw3u31",  DVB_TYPE_ISDB_T },
++    { "/dev/pxw3u33", DVB_TYPE_ISDB_T },
++    { "/dev/pxs3u21",   DVB_TYPE_ISDB_T },
++    { "/dev/pxs3u1",   DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV2", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV3", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV6", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV7", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV10", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV11", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV14", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV15", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV18", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV19", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV22", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV23", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV26", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV27", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV30", DVB_TYPE_ISDB_T },
++    { "/dev/px4-DTV31", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV0", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV1", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV2", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV3", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV4", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV5", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV6", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV7", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV8", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV9", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV10", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV11", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV12", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV13", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV14", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV15", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV16", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV17", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV18", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV19", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV20", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV21", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV22", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV23", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV24", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV25", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV26", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV27", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV28", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV29", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV30", DVB_TYPE_ISDB_T },
++    { "/dev/px5-DTV31", DVB_TYPE_ISDB_T }
++};
++
++const pt1_dev_info_t* is_pt1_dev_path(char const *path)
++{
++    size_t i;
++    for (i = 0; i < (sizeof(devices) / sizeof(*devices)); i++) {
++        if (!strcmp(devices[i].path, path)) return &devices[i];
++    }
++    return NULL;
++}
++
++/*
++ * ISDB-T: derive the kernel driver's `frequencyno` from the mux frequency
++ * (Hz). The kernel's internal table is contiguous within three segments of
++ * 6 MHz spacing, with two 8 MHz jumps at the historical analog-TV channel
++ * boundaries (sub-VHF / VHF-high / UHF13-up). There is no single formula
++ * across the whole UHF/VHF range; instead we describe each segment
++ * explicitly so a single linear formula applies inside it.
++ */
++typedef struct pt1_isdbt_segment {
++    uint32_t lo_hz;     /* lowest centre frequency in this segment */
++    uint32_t hi_hz;     /* highest centre frequency in this segment */
++    int      base_no;   /* kernel frequencyno that corresponds to lo_hz */
++} pt1_isdbt_segment_t;
++
++#define PT1_ISDBT_STEP_HZ        6000000u   /* 6 MHz channel raster */
++#define PT1_ISDBT_TOLERANCE_HZ    100000u   /* ±100 kHz of the grid */
++
++static const pt1_isdbt_segment_t isdbt_segments[] = {
++    { 111143000u, 159143000u,  3 },  /* sub-VHF block, freqno  3.. 11 */
++    { 167143000u, 167143000u, 12 },  /*     singleton, freqno 12      */
++    { 225143000u, 465143000u, 22 },  /* VHF-high block, freqno 22.. 62 */
++    { 473143000u, 473143000u, 63 },  /* UHF13 singleton, freqno 63    */
++    { 479143000u, 767143000u, 64 },  /* UHF14..62 block, freqno 64..112 */
++};
++
++/*
++ * ISDB-S: derive `frequencyno` (transponder index, 0..23) from the PHYSICAL
++ * satellite downlink frequency in kHz. We subtract the Japanese BS standard
++ * LO (10.678 GHz) internally and split the range into the BS plane
++ * (38.36 MHz spacing) and the CS plane (40 MHz spacing). tvheadend's
++ * network-level LNB selector is intentionally ignored.
++ *
++ *   BS  freqno  0..11 : IF 1 049 480..1 471 440 kHz  (= 11.727 480..12.149 440 GHz)
++ *   CS  freqno 12..23 : IF 1 613 000..2 053 000 kHz  (= 12.291 000..12.731 000 GHz)
++ */
++#define PT1_ISDBS_LO_KHZ           10678000u
++#define PT1_ISDBS_BS_LO_IF_KHZ      1049480u
++#define PT1_ISDBS_BS_HI_IF_KHZ      1471440u
++#define PT1_ISDBS_BS_STEP_KHZ         38360u
++#define PT1_ISDBS_CS_LO_IF_KHZ      1613000u
++#define PT1_ISDBS_CS_HI_IF_KHZ      2053000u
++#define PT1_ISDBS_CS_STEP_KHZ         40000u
++#define PT1_ISDBS_CS_BASE_NO             12
++#define PT1_ISDBS_TOLERANCE_KHZ          100   /* ±100 kHz of the grid */
++
++static int pt1_resolve_isdbt(uint32_t freq_hz, FREQUENCY *out)
++{
++    size_t i;
++    for (i = 0; i < sizeof(isdbt_segments) / sizeof(*isdbt_segments); i++) {
++        const pt1_isdbt_segment_t *s = &isdbt_segments[i];
++        if (freq_hz < s->lo_hz - PT1_ISDBT_TOLERANCE_HZ) continue;
++        if (freq_hz > s->hi_hz + PT1_ISDBT_TOLERANCE_HZ) continue;
++
++        /* Round to the nearest 6 MHz step inside the segment. */
++        int64_t delta = (int64_t)freq_hz - (int64_t)s->lo_hz;
++        int     step  = (int)((delta + (int64_t)PT1_ISDBT_STEP_HZ / 2) /
++                              (int64_t)PT1_ISDBT_STEP_HZ);
++        uint32_t centre = s->lo_hz + (uint32_t)step * PT1_ISDBT_STEP_HZ;
++
++        uint32_t diff = (centre > freq_hz) ? centre - freq_hz : freq_hz - centre;
++        if (diff > PT1_ISDBT_TOLERANCE_HZ) continue;
++        if (centre < s->lo_hz || centre > s->hi_hz) continue;
++
++        out->frequencyno = s->base_no + step;
++        out->slot        = 0;
++        return 0;
++    }
++    return -1;
++}
++
++static int pt1_resolve_isdbs(uint32_t freq_khz, int slot, FREQUENCY *out)
++{
++    if (freq_khz <= PT1_ISDBS_LO_KHZ) return -1;
++    uint32_t if_khz = freq_khz - PT1_ISDBS_LO_KHZ;
++
++    /* BS plane */
++    if (if_khz + PT1_ISDBS_TOLERANCE_KHZ >= PT1_ISDBS_BS_LO_IF_KHZ &&
++        if_khz <= PT1_ISDBS_BS_HI_IF_KHZ + PT1_ISDBS_TOLERANCE_KHZ) {
++        int32_t delta = (int32_t)if_khz - (int32_t)PT1_ISDBS_BS_LO_IF_KHZ;
++        int     step  = (delta + (int32_t)PT1_ISDBS_BS_STEP_KHZ / 2) /
++                        (int32_t)PT1_ISDBS_BS_STEP_KHZ;
++        uint32_t centre = PT1_ISDBS_BS_LO_IF_KHZ + (uint32_t)step * PT1_ISDBS_BS_STEP_KHZ;
++        uint32_t diff   = (centre > if_khz) ? centre - if_khz : if_khz - centre;
++        if (step >= 0 && step <= 11 && diff <= PT1_ISDBS_TOLERANCE_KHZ) {
++            out->frequencyno = step;
++            out->slot        = slot;
++            return 0;
++        }
++    }
++
++    /* CS plane */
++    if (if_khz + PT1_ISDBS_TOLERANCE_KHZ >= PT1_ISDBS_CS_LO_IF_KHZ &&
++        if_khz <= PT1_ISDBS_CS_HI_IF_KHZ + PT1_ISDBS_TOLERANCE_KHZ) {
++        int32_t delta = (int32_t)if_khz - (int32_t)PT1_ISDBS_CS_LO_IF_KHZ;
++        int     step  = (delta + (int32_t)PT1_ISDBS_CS_STEP_KHZ / 2) /
++                        (int32_t)PT1_ISDBS_CS_STEP_KHZ;
++        uint32_t centre = PT1_ISDBS_CS_LO_IF_KHZ + (uint32_t)step * PT1_ISDBS_CS_STEP_KHZ;
++        uint32_t diff   = (centre > if_khz) ? centre - if_khz : if_khz - centre;
++        if (step >= 0 && step <= (23 - PT1_ISDBS_CS_BASE_NO) && diff <= PT1_ISDBS_TOLERANCE_KHZ) {
++            out->frequencyno = PT1_ISDBS_CS_BASE_NO + step;
++            out->slot        = slot;
++            return 0;
++        }
++    }
++
++    return -1;
++}
++
++int pt1_resolve_freq(uint32_t freq, int stream_id,
++                     dvb_fe_type_t type, FREQUENCY *out)
++{
++    if (out == NULL) return -1;
++    switch (type) {
++        case DVB_TYPE_ISDB_T:
++            return pt1_resolve_isdbt(freq, out);
++        case DVB_TYPE_ISDB_S:
++            return pt1_resolve_isdbs(freq, stream_id, out);
++        default:
++            return -1;
++    }
++}
++
+--- /dev/null
++++ b/src/input/mpegts/pt1/pt1_dev.h
+@@ -0,0 +1,35 @@
++#ifndef _PT1_DEV_H_
++#define _PT1_DEV_H_
++#include "../dvb.h"
++#include "pt1_ioctl.h"
++
++struct pt1_dev_info
++{
++    const char *path;
++    dvb_fe_type_t type;
++};
++
++typedef struct pt1_dev_info pt1_dev_info_t;
++
++const pt1_dev_info_t* is_pt1_dev_path(char const *path);
++
++/*
++ * Resolve a mux into the kernel ioctl arg for SET_CHANNEL.
++ *
++ *   ISDB-T : freq is the UHF/VHF centre frequency in Hz.
++ *            stream_id is ignored. out->slot is set to 0.
++ *   ISDB-S : freq is the PHYSICAL satellite downlink frequency in kHz
++ *            (e.g. 11727480 for BS-1). The Japanese BS LO of 10.678 GHz
++ *            is subtracted internally; tvheadend's network-level LNB
++ *            selector is NOT consulted (Japanese BS/CS is single-band and
++ *            does not fit tvheadend's Universal-LNB defaults).
++ *            stream_id supplies out->slot (the ARIB TSID the kernel uses
++ *            to pick a stream on the transponder).
++ *
++ * Returns 0 on success and fills *out, or -1 if the frequency falls outside
++ * any supported segment (with ±100 kHz tolerance).
++ */
++int pt1_resolve_freq(uint32_t freq, int stream_id,
++                     dvb_fe_type_t type, FREQUENCY *out);
++
++#endif
+--- /dev/null
++++ b/src/input/mpegts/pt1/pt1_ioctl.h
+@@ -0,0 +1,22 @@
++#ifndef		__PT1_IOCTL_H__
++#define		__PT1_IOCTL_H__
++/***************************************************************************/
++/* チャンネル周波数情報構造体定義                                          */
++/***************************************************************************/
++typedef	struct	_frequency{
++	int		frequencyno ;			// 周波数テーブル番号
++	int		slot ;					// スロット番号／加算する周波数
++}FREQUENCY;
++
++/***************************************************************************/
++/* IOCTL定義                                                               */
++/***************************************************************************/
++#define		SET_CHANNEL	_IOW(0x8D, 0x01, FREQUENCY)
++#define		START_REC	_IO(0x8D, 0x02)
++#define		STOP_REC	_IO(0x8D, 0x03)
++#define		GET_SIGNAL_STRENGTH	_IOR(0x8D, 0x04, int *)
++#define		LNB_ENABLE	_IOW(0x8D, 0x05, int)
++#define		LNB_DISABLE	_IO(0x8D, 0x06)
++#define PTX_SET_SYSTEM_MODE	_IOW(0x8d, 0x0b, int)
++
++#endif
+--- a/src/main.c
++++ b/src/main.c
+@@ -157,7 +157,7 @@ const tvh_caps_t tvheadend_capabilities[
+ #if ENABLE_CWC || ENABLE_CAPMT || ENABLE_CONSTCW || ENABLE_CCCAM
+   { "caclient", NULL },
+ #endif
+-#if ENABLE_LINUXDVB || ENABLE_SATIP_CLIENT || ENABLE_HDHOMERUN_CLIENT
++#if ENABLE_LINUXDVB || ENABLE_SATIP_CLIENT || ENABLE_HDHOMERUN_CLIENT || ENABLE_PT1
+   { "tvadapters", NULL },
+ #endif
+ #if ENABLE_SATIP_CLIENT
+--- a/src/tvhlog.c
++++ b/src/tvhlog.c
+@@ -163,6 +163,7 @@ tvhlog_subsys_t tvhlog_subsystems[] = {
+   [LS_IPTV_PCR]      = { "iptv-pcr",      N_("IPTV PCR") },
+   [LS_IPTV_SUB]      = { "iptv-sub",      N_("IPTV Subcription") },
+   [LS_LINUXDVB]      = { "linuxdvb",      N_("LinuxDVB Input") },
++  [LS_PT1]           = { "pt1",           N_("PT1/PX-series chardev tuner") },
+   [LS_DISEQC]        = { "diseqc",        N_("DiseqC") },
+   [LS_EN50221]       = { "en50221",       N_("CI Module") },
+   [LS_EN50494]       = { "en50494",       N_("Unicable (EN50494)") },
+--- a/src/tvhlog.h
++++ b/src/tvhlog.h
+@@ -182,6 +182,7 @@ enum {
+   LS_IPTV_PCR,
+   LS_IPTV_SUB,
+   LS_LINUXDVB,
++  LS_PT1,
+   LS_DISEQC,
+   LS_EN50221,
+   LS_EN50494,
