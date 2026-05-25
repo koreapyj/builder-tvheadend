@@ -114,7 +114,11 @@
 + *****************************************************************************/
 --- /dev/null
 +++ b/src/input/mpegts/pt1/pt1.c
-@@ -0,0 +1,1008 @@
+@@ -0,0 +1,1158 @@
++/* pthread_timedjoin_np is a glibc extension; must be requested before
++ * any system header drags pthread.h in. */
++#define _GNU_SOURCE
++
 +#include "tvheadend.h"
 +#include "input.h"
 +#include "settings.h"
@@ -146,8 +150,17 @@
 +   */
 +  char    *pt_name;
 +  char    *pt_rootpath;
-+  pt1_frontend_t *pt_frontend;
++  /* Up to two frontends per chardev (ISDB-T and/or ISDB-S). Unified
++   * chardevs host both; hardwired ones leave the unused slot NULL. */
++  pt1_frontend_t *pt_fe[2];      /* indexed by PT1_FE_T / PT1_FE_S */
++  pt1_frontend_t *pt_busy_fe;    /* whichever frontend holds the chardev
++                                    fd right now, or NULL */
++  tvh_mutex_t     pt_busy_lock;  /* guards pt_busy_fe */
 +};
++
++#define PT1_FE_T 0
++#define PT1_FE_S 1
++#define PT1_FE_SLOT(type)  ((type) == DVB_TYPE_ISDB_T ? PT1_FE_T : PT1_FE_S)
 +
 +struct pt1_frontend
 +{
@@ -208,9 +221,11 @@
 +  idnode_save(&la->th_id, m);
 +
 +  if (filename) {
-+    /* Frontends */
++    /* Frontends — one submap per delsys, mirroring linuxdvb's layout. */
++    int i;
 +    l = htsmsg_create_map();
-+    pt1_frontend_save(la->pt_frontend, l);
++    for (i = 0; i < 2; i++)
++      if (la->pt_fe[i]) pt1_frontend_save(la->pt_fe[i], l);
 +    htsmsg_add_msg(m, "frontends", l);
 +
 +    /* Filename */
@@ -226,7 +241,13 @@
 +  ( idnode_t *in, const char *lang, char *dst, size_t dstsize )
 +{
 +  pt1_adapter_t *la = (pt1_adapter_t*)in;
-+  snprintf(dst, dstsize, "%s", la->pt_rootpath);
++  /* Mirror linuxdvb_adapter_class_get_title: "<rootpath> [<name>]" so
++   * the operator sees both the chardev they're configuring and the
++   * resolved hardware label. */
++  if (la->pt_name && la->pt_rootpath)
++    snprintf(dst, dstsize, "%s [%s]", la->pt_rootpath, la->pt_name);
++  else
++    snprintf(dst, dstsize, "%s", la->pt_rootpath ?: (la->pt_name ?: ""));
 +}
 +
 +static const void *
@@ -234,7 +255,15 @@
 +{
 +  pt1_adapter_t *la = (pt1_adapter_t*)obj;
 +  static int active = 0;
-+  active = la->pt_frontend->mi_is_enabled((mpegts_input_t*)la->pt_frontend, NULL, 0, -1) != MI_IS_ENABLED_NEVER;
++  int i;
++  active = 0;
++  for (i = 0; i < 2; i++) {
++    pt1_frontend_t *fe = la->pt_fe[i];
++    if (fe && fe->mi_is_enabled((mpegts_input_t*)fe, NULL, 0, -1) != MI_IS_ENABLED_NEVER) {
++      active = 1;
++      break;
++    }
++  }
 +  return &active;
 +}
 +
@@ -243,7 +272,9 @@
 +{
 +  pt1_adapter_t *la = (pt1_adapter_t*)in;
 +  idnode_set_t *is = idnode_set_create(0);
-+  idnode_set_add(is, &la->pt_frontend->ti_id, NULL, NULL);
++  int i;
++  for (i = 0; i < 2; i++)
++    if (la->pt_fe[i]) idnode_set_add(is, &la->pt_fe[i]->ti_id, NULL, NULL);
 +  return is;
 +}
 +
@@ -383,6 +414,14 @@
 +  tvhtrace(LS_PT1, "%s - closing FE %s",
 +           name, lfe->pfe_adapter->pt_rootpath);
 +  close(fd);
++
++  /* Release the chardev so the sibling frontend (if any) can tune. */
++  if (lfe->pfe_adapter) {
++    pt1_adapter_t *la = lfe->pfe_adapter;
++    tvh_mutex_lock(&la->pt_busy_lock);
++    if (la->pt_busy_fe == lfe) la->pt_busy_fe = NULL;
++    tvh_mutex_unlock(&la->pt_busy_lock);
++  }
 +}
 +
 +static int
@@ -401,6 +440,15 @@
 +
 +  tvhtrace(LS_PT1, "%s - opening FE %s (%d)",
 +           name, lfe->pfe_adapter->pt_rootpath, fd);
++
++  /* Claim the chardev — sibling frontend (if any) will report
++   * MI_IS_ENABLED_RETRY in mi_is_enabled until we close. */
++  if (lfe->pfe_adapter) {
++    pt1_adapter_t *la = lfe->pfe_adapter;
++    tvh_mutex_lock(&la->pt_busy_lock);
++    la->pt_busy_fe = lfe;
++    tvh_mutex_unlock(&la->pt_busy_lock);
++  }
 +
 +  return lfe->pfe_fd;
 +}
@@ -609,6 +657,12 @@
 +               name, errno, strerror(errno));
 +      break;
 +    }
++    /* sbuf_read returns 0 both on kernel EOF (STOP_REC) and when our sbuf
++     * was full so read() was called with size 0. We can't disambiguate
++     * here, so don't bail on n == 0: the STOP_REC path still exits via
++     * the while-head check (stop_mux sets pfe_thread_running = 0 before
++     * the ioctl); the sbuf-full path falls through to recv_packets which
++     * drains so the next sbuf_read can resume. */
 +
 +    /* Skip the initial bytes */
 +    if (counter < skip) {
@@ -701,17 +755,25 @@
 +
 +  dvr = lfe->pfe_fd;
 +  if (dvr > 0 && !lfe->pfe_dvr_error) {
-+    if (ioctl(dvr, GET_SIGNAL_STRENGTH, &snr) != 0) {
-+      tvherror(LS_PT1, "%s - GET_SIGNAL_STRENGTH failed [e=%s]", buf, strerror(errno));
-+    } else if (lfe->pfe_type == DVB_TYPE_ISDB_S) {
-+      // TODO
-+      snr_scale = SIGNAL_STATUS_SCALE_DECIBEL;
++    uint32_t raw = 0;
++    /*
++     * ioctl can transiently return -EINVAL on px4_drv chardevs when the
++     * kernel hasn't yet committed `current_system` (the SET_CHANNEL ↔
++     * tune+lock dance is racing the monitor). Log at trace only and leave
++     * the previous snr_scale/snr in place rather than blanking them.
++     */
++    if (ioctl(dvr, GET_SIGNAL_STRENGTH, &raw) != 0) {
++      tvhtrace(LS_PT1, "%s - GET_SIGNAL_STRENGTH failed [e=%s]",
++               buf, strerror(errno));
 +    } else {
-+      snr_scale = SIGNAL_STATUS_SCALE_DECIBEL;
-+      double P = log10(5505024/(double)snr) * 10;
-+      double CNR = (0.000024 * P * P * P * P) - (0.0016 * P * P * P) +
-+                    (0.0398 * P * P) + (0.5491 * P)+3.0965;
-+      snr = CNR * 1000;
++      int mdb = pt1_cn_to_millibel(lfe->pfe_adapter->pt_rootpath,
++                                   lfe->pfe_type, raw);
++      tvhtrace(LS_PT1, "%s - CN raw=0x%x -> %d.%03d dB",
++               buf, raw, mdb / 1000, abs(mdb % 1000));
++      if (mdb != INT_MIN) {
++        snr = mdb;
++        snr_scale = SIGNAL_STATUS_SCALE_DECIBEL;
++      }
 +    }
 +  }
 +
@@ -721,8 +783,12 @@
 +  mmi->tii_stats.signal = 0;
 +  mmi->tii_stats.ec_bit = 0;
 +  mmi->tii_stats.tc_bit = 0;
-+  mmi->tii_stats.snr_scale = snr_scale;
-+  mmi->tii_stats.snr = snr;
++  /* Only refresh snr stats when we got a fresh sample; a transient ioctl
++   * failure shouldn't wipe out the previous good reading. */
++  if (snr_scale != SIGNAL_STATUS_SCALE_UNKNOWN) {
++    mmi->tii_stats.snr_scale = snr_scale;
++    mmi->tii_stats.snr = snr;
++  }
 +  mmi->tii_stats.tc_block = 0;
 +
 +  /* Send message */
@@ -792,9 +858,52 @@
 +
 +  /* Stop thread */
 +  if (lfe->pfe_thread_started) {
++    int fd;
++    struct timespec ts;
++    int jr;
++
 +    lfe->pfe_thread_running = 0;
++
++    /*
++     * Unblock the input thread's read() before joining. Without this the
++     * thread parks in the kernel ringbuffer's wait_event indefinitely on
++     * silent muxes; pthread_join then never returns and tvheadend's
++     * global_lock holder (the scan) stalls everything else.
++     *
++     * STOP_REC (= PTX_STOP_STREAMING) calls ringbuffer_stop + wake_up in
++     * the px4_drv chardev path, which is exactly what the reader's
++     * wait_event_interruptible condition checks (ringbuffer_is_running).
++     * The fd is owned by the input thread (it atomic_exchanges pfe_fd to
++     * -1 on its way out); a relaxed read here can race with that exit
++     * and land an ioctl on a closed fd -- kernel returns EBADF, harmless.
++     */
++    fd = lfe->pfe_fd;
++    if (fd > 0) {
++      if (ioctl(fd, STOP_REC, NULL) != 0)
++        tvhtrace(LS_PT1, "%s - STOP_REC (stop_mux) failed: %s",
++                 buf1, strerror(errno));
++      if (lfe->pfe_type == DVB_TYPE_ISDB_S)
++        (void)ioctl(fd, LNB_DISABLE, 0);
++    }
++
 +    tvhtrace(LS_PT1, "%s - waiting for dvr thread", buf1);
-+    pthread_join(lfe->pfe_dvr_thread, NULL);
++
++    /*
++     * Watchdog the join. If the driver ever fails to wake the reader
++     * (set_capture returned non-zero, so the kernel's wake_up was
++     * skipped), detach the stuck thread and keep tvheadend alive rather
++     * than freezing under global_lock.
++     */
++    clock_gettime(CLOCK_REALTIME, &ts);
++    ts.tv_sec += 5;
++    jr = pthread_timedjoin_np(lfe->pfe_dvr_thread, NULL, &ts);
++    if (jr == ETIMEDOUT) {
++      tvherror(LS_PT1, "%s - dvr thread did not stop within 5s after STOP_REC; detaching",
++               buf1);
++      pthread_detach(lfe->pfe_dvr_thread);
++    } else if (jr != 0) {
++      tvhwarn(LS_PT1, "%s - pthread_timedjoin: %s", buf1, strerror(jr));
++    }
 +    lfe->pfe_thread_started = 0;
 +    tvhdebug(LS_PT1, "%s - stopped dvr thread", buf1);
 +  }
@@ -813,6 +922,7 @@
 +  ( mpegts_input_t *mi, mpegts_mux_t *mm, int flags, int weight )
 +{
 +  pt1_frontend_t *lfe = (pt1_frontend_t*)mi;
++  pt1_adapter_t  *la  = lfe->pfe_adapter;
 +  int w;
 +
 +  w = mpegts_input_is_enabled(mi, mm, flags, weight);
@@ -822,6 +932,16 @@
 +    return MI_IS_ENABLED_OK;
 +  if (lfe->pfe_in_setup)
 +    return MI_IS_ENABLED_RETRY;
++
++  /* Unified chardevs (PX5, PXMLT, ISDB6014) host two frontends sharing
++   * one fd; if the sibling already holds the chardev, defer this one. */
++  if (la) {
++    int busy;
++    tvh_mutex_lock(&la->pt_busy_lock);
++    busy = (la->pt_busy_fe != NULL && la->pt_busy_fe != lfe);
++    tvh_mutex_unlock(&la->pt_busy_lock);
++    if (busy) return MI_IS_ENABLED_RETRY;
++  }
 +
 +  return MI_IS_ENABLED_OK;
 +}
@@ -861,9 +981,16 @@
 +  lfe = (pt1_frontend_t*)mpegts_input_create0((mpegts_input_t*)lfe, idc, uuid, conf);
 +  if (!lfe) return NULL;
 +
-+  /* Default name */
-+  if (!lfe->mi_name) {
-+    lfe->mi_name = strdup(la->pt_rootpath);
++  /* Default name: "<adapter-label> : <delsys> #0", mirroring linuxdvb.
++   * Replace any prior saved name so the linuxdvb-style label survives
++   * upgrades from the old "/dev/ptXvideoY" form. */
++  {
++    char namebuf[320];
++    snprintf(namebuf, sizeof(namebuf), "%s : %s #0",
++             la->pt_name ?: la->pt_rootpath,
++             dvb_type2str(type));
++    free(lfe->mi_name);
++    lfe->mi_name = strdup(namebuf);
 +  }
 +
 +  /* Input callbacks */
@@ -906,8 +1033,17 @@
 +
 +  free(la->pt_rootpath);
 +  la->pt_rootpath   = strdup(path);
-+  la->pt_name       = strdup(path);
-+  la->pt_frontend   = NULL;
++  {
++    char buf[256];
++    if (pt1_make_adapter_label(path, buf, sizeof(buf)) == 0)
++      la->pt_name = strdup(buf);
++    else
++      la->pt_name = strdup(path);
++  }
++  la->pt_fe[0]      = NULL;
++  la->pt_fe[1]      = NULL;
++  la->pt_busy_fe    = NULL;
++  tvh_mutex_init(&la->pt_busy_lock, NULL);
 +
 +  /* Callbacks */
 +  //la->la_is_enabled = linuxdvb_adapter_is_enabled;
@@ -975,7 +1111,11 @@
 +    if (conf)
 +      feconf = htsmsg_get_map(conf, "frontends");
 +
-+    la->pt_frontend = pt1_frontend_create(feconf, la, dev_info->type);
++    /* One frontend per cap bit; unified chardevs get both. */
++    if (dev_info->system_cap & PT1_CAP_T)
++      la->pt_fe[PT1_FE_T] = pt1_frontend_create(feconf, la, DVB_TYPE_ISDB_T);
++    if (dev_info->system_cap & PT1_CAP_S)
++      la->pt_fe[PT1_FE_S] = pt1_frontend_create(feconf, la, DVB_TYPE_ISDB_S);
 +    tvh_mutex_unlock(&global_lock);
 +  } while(0);
 +
@@ -1013,8 +1153,15 @@
 +  if (lfe->pfe_fd > 0)
 +    close(lfe->pfe_fd);
 +
-+  /* Remove from adapter */
-+  if (lfe->pfe_adapter) lfe->pfe_adapter->pt_frontend = NULL;
++  /* Remove from adapter, clearing whichever slot we occupied. */
++  if (lfe->pfe_adapter) {
++    pt1_adapter_t *la = lfe->pfe_adapter;
++    int slot = PT1_FE_SLOT(lfe->pfe_type);
++    if (la->pt_fe[slot] == lfe) la->pt_fe[slot] = NULL;
++    tvh_mutex_lock(&la->pt_busy_lock);
++    if (la->pt_busy_fe == lfe) la->pt_busy_fe = NULL;
++    tvh_mutex_unlock(&la->pt_busy_lock);
++  }
 +
 +  /* Finish */
 +  mpegts_input_delete((mpegts_input_t*)lfe, 0);
@@ -1036,12 +1183,15 @@
 +
 +  idnode_save_check(&la->th_id, 0);
 +
-+  if (la->pt_frontend) pt1_frontend_destroy(la->pt_frontend);
++  if (la->pt_fe[PT1_FE_T]) pt1_frontend_destroy(la->pt_fe[PT1_FE_T]);
++  if (la->pt_fe[PT1_FE_S]) pt1_frontend_destroy(la->pt_fe[PT1_FE_S]);
++
++  tvh_mutex_destroy(&la->pt_busy_lock);
 +
 +  /* Free memory */
 +  free(la->pt_rootpath);
 +  free(la->pt_name);
-+    
++
 +  /* Delete */
 +  tvh_hardware_delete((tvh_hardware_t*)la);
 +
@@ -1125,189 +1275,158 @@
 +}
 --- /dev/null
 +++ b/src/input/mpegts/pt1/pt1_dev.c
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,658 @@
 +#include "tvheadend.h"
 +#include "pt1_dev.h"
 +
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <ctype.h>
++#include <limits.h>
++#include <math.h>
++#include <stdlib.h>
 +
++/*
++ * Per-chardev capability table.
++ *
++ *   PT1, PT3, ASV522, PXQ3PE, PXW3U, PXS3U: hardwired — each chardev is
++ *     ISDB-S or ISDB-T at build time.
++ *   PX4 (video / -DTV): hardwired per-index split (0,1,4,5,... = S;
++ *     2,3,6,7,... = T).
++ *   PX5, PXMLT5, PXMLT8, ISDB6014: unified — each chardev can do either
++ *     delivery system at runtime, selected via PTX_SET_SYSTEM_MODE.
++ *
++ * Unified entries set both bits and end up creating two frontends per
++ * adapter sharing the chardev fd (mutex-gated in pt1.c).
++ */
 +static const pt1_dev_info_t devices[] = {
-+    { "/dev/pt1video0", DVB_TYPE_ISDB_S },
-+    { "/dev/pt1video1", DVB_TYPE_ISDB_S },
-+    { "/dev/pt1video5", DVB_TYPE_ISDB_S },
-+    { "/dev/pt1video4", DVB_TYPE_ISDB_S },
-+    { "/dev/pt1video9", DVB_TYPE_ISDB_S },
-+    { "/dev/pt1video8", DVB_TYPE_ISDB_S },
-+    { "/dev/pt1video13", DVB_TYPE_ISDB_S },
-+    { "/dev/pt1video12", DVB_TYPE_ISDB_S },
-+    { "/dev/pt3video1", DVB_TYPE_ISDB_S },
-+    { "/dev/pt3video0", DVB_TYPE_ISDB_S },
-+    { "/dev/pt3video5", DVB_TYPE_ISDB_S },
-+    { "/dev/pt3video4", DVB_TYPE_ISDB_S },
-+    { "/dev/pt3video9", DVB_TYPE_ISDB_S },
-+    { "/dev/pt3video8", DVB_TYPE_ISDB_S },
-+    { "/dev/pt3video13", DVB_TYPE_ISDB_S },
-+    { "/dev/pt3video12", DVB_TYPE_ISDB_S },
-+    { "/dev/px4video0", DVB_TYPE_ISDB_S },
-+    { "/dev/px4video1", DVB_TYPE_ISDB_S },
-+    { "/dev/px4video4", DVB_TYPE_ISDB_S },
-+    { "/dev/px4video5", DVB_TYPE_ISDB_S },
-+    { "/dev/asv52201", DVB_TYPE_ISDB_S },
-+    { "/dev/asv52200", DVB_TYPE_ISDB_S },
-+    { "/dev/asv52205", DVB_TYPE_ISDB_S },
-+    { "/dev/asv52204", DVB_TYPE_ISDB_S },
-+    { "/dev/asv52209", DVB_TYPE_ISDB_S },
-+    { "/dev/asv52208", DVB_TYPE_ISDB_S },
-+    { "/dev/asv522013", DVB_TYPE_ISDB_S },
-+    { "/dev/asv522012", DVB_TYPE_ISDB_S },
-+    { "/dev/pxq3pe0", DVB_TYPE_ISDB_S },
-+    { "/dev/pxq3pe1", DVB_TYPE_ISDB_S },
-+    { "/dev/pxq3pe4", DVB_TYPE_ISDB_S },
-+    { "/dev/pxq3pe5", DVB_TYPE_ISDB_S },
-+    { "/dev/pxq3pe8", DVB_TYPE_ISDB_S },
-+    { "/dev/pxq3pe9", DVB_TYPE_ISDB_S },
-+    { "/dev/pxq3pe12", DVB_TYPE_ISDB_S },
-+    { "/dev/pxq3pe13", DVB_TYPE_ISDB_S },
-+    { "/dev/pxw3u30",   DVB_TYPE_ISDB_S },
-+    { "/dev/pxw3u32", DVB_TYPE_ISDB_S },
-+    { "/dev/pxs3u20",   DVB_TYPE_ISDB_S },
-+    { "/dev/pxs3u0",  DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV0", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV1", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV4", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV5", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV8", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV9", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV12", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV13", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV16", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV17", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV20", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV21", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV24", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV25", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV28", DVB_TYPE_ISDB_S },
-+    { "/dev/px4-DTV29", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV0", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV1", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV2", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV3", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV4", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV5", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV6", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV7", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV8", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV9", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV10", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV11", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV12", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV13", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV14", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV15", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV16", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV17", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV18", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV19", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV20", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV21", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV22", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV23", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV24", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV25", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV26", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV27", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV28", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV29", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV30", DVB_TYPE_ISDB_S },
-+    { "/dev/px5-DTV31", DVB_TYPE_ISDB_S },
++    /* Earthsoft PT1 (PCI; hardwired S/T split per chardev) */
++    { "/dev/pt1video0",  PT1_CAP_S }, { "/dev/pt1video1",  PT1_CAP_S },
++    { "/dev/pt1video2",  PT1_CAP_T }, { "/dev/pt1video3",  PT1_CAP_T },
++    { "/dev/pt1video4",  PT1_CAP_S }, { "/dev/pt1video5",  PT1_CAP_S },
++    { "/dev/pt1video6",  PT1_CAP_T }, { "/dev/pt1video7",  PT1_CAP_T },
++    { "/dev/pt1video8",  PT1_CAP_S }, { "/dev/pt1video9",  PT1_CAP_S },
++    { "/dev/pt1video10", PT1_CAP_T }, { "/dev/pt1video11", PT1_CAP_T },
++    { "/dev/pt1video12", PT1_CAP_S }, { "/dev/pt1video13", PT1_CAP_S },
++    { "/dev/pt1video14", PT1_CAP_T }, { "/dev/pt1video15", PT1_CAP_T },
 +
-+    { "/dev/pt1video2", DVB_TYPE_ISDB_T },
-+    { "/dev/pt1video3", DVB_TYPE_ISDB_T },
-+    { "/dev/pt1video6", DVB_TYPE_ISDB_T },
-+    { "/dev/pt1video7", DVB_TYPE_ISDB_T },
-+    { "/dev/pt1video10", DVB_TYPE_ISDB_T },
-+    { "/dev/pt1video11", DVB_TYPE_ISDB_T },
-+    { "/dev/pt1video14", DVB_TYPE_ISDB_T },
-+    { "/dev/pt1video15", DVB_TYPE_ISDB_T },
-+    { "/dev/pt3video2", DVB_TYPE_ISDB_T },
-+    { "/dev/pt3video3", DVB_TYPE_ISDB_T },
-+    { "/dev/pt3video6", DVB_TYPE_ISDB_T },
-+    { "/dev/pt3video7", DVB_TYPE_ISDB_T },
-+    { "/dev/pt3video10", DVB_TYPE_ISDB_T },
-+    { "/dev/pt3video11", DVB_TYPE_ISDB_T },
-+    { "/dev/pt3video14", DVB_TYPE_ISDB_T },
-+    { "/dev/pt3video15", DVB_TYPE_ISDB_T },
-+    { "/dev/px4video2", DVB_TYPE_ISDB_T },
-+    { "/dev/px4video3", DVB_TYPE_ISDB_T },
-+    { "/dev/px4video6", DVB_TYPE_ISDB_T },
-+    { "/dev/px4video7", DVB_TYPE_ISDB_T },
-+    { "/dev/asv52202", DVB_TYPE_ISDB_T },
-+    { "/dev/asv52203", DVB_TYPE_ISDB_T },
-+    { "/dev/asv52206", DVB_TYPE_ISDB_T },
-+    { "/dev/asv52207", DVB_TYPE_ISDB_T },
-+    { "/dev/asv522010", DVB_TYPE_ISDB_T },
-+    { "/dev/asv522011", DVB_TYPE_ISDB_T },
-+    { "/dev/asv522014", DVB_TYPE_ISDB_T },
-+    { "/dev/asv522015", DVB_TYPE_ISDB_T },
-+    { "/dev/pxq3pe2", DVB_TYPE_ISDB_T },
-+    { "/dev/pxq3pe3", DVB_TYPE_ISDB_T },
-+    { "/dev/pxq3pe6", DVB_TYPE_ISDB_T },
-+    { "/dev/pxq3pe7", DVB_TYPE_ISDB_T },
-+    { "/dev/pxq3pe10", DVB_TYPE_ISDB_T },
-+    { "/dev/pxq3pe11", DVB_TYPE_ISDB_T },
-+    { "/dev/pxq3pe14", DVB_TYPE_ISDB_T },
-+    { "/dev/pxq3pe15", DVB_TYPE_ISDB_T },
-+    { "/dev/pxw3u31",  DVB_TYPE_ISDB_T },
-+    { "/dev/pxw3u33", DVB_TYPE_ISDB_T },
-+    { "/dev/pxs3u21",   DVB_TYPE_ISDB_T },
-+    { "/dev/pxs3u1",   DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV2", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV3", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV6", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV7", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV10", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV11", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV14", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV15", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV18", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV19", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV22", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV23", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV26", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV27", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV30", DVB_TYPE_ISDB_T },
-+    { "/dev/px4-DTV31", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV0", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV1", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV2", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV3", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV4", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV5", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV6", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV7", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV8", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV9", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV10", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV11", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV12", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV13", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV14", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV15", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV16", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV17", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV18", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV19", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV20", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV21", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV22", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV23", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV24", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV25", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV26", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV27", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV28", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV29", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV30", DVB_TYPE_ISDB_T },
-+    { "/dev/px5-DTV31", DVB_TYPE_ISDB_T }
++    /* Earthsoft PT3 (PCI; hardwired S/T split per chardev) */
++    { "/dev/pt3video0",  PT1_CAP_S }, { "/dev/pt3video1",  PT1_CAP_S },
++    { "/dev/pt3video2",  PT1_CAP_T }, { "/dev/pt3video3",  PT1_CAP_T },
++    { "/dev/pt3video4",  PT1_CAP_S }, { "/dev/pt3video5",  PT1_CAP_S },
++    { "/dev/pt3video6",  PT1_CAP_T }, { "/dev/pt3video7",  PT1_CAP_T },
++    { "/dev/pt3video8",  PT1_CAP_S }, { "/dev/pt3video9",  PT1_CAP_S },
++    { "/dev/pt3video10", PT1_CAP_T }, { "/dev/pt3video11", PT1_CAP_T },
++    { "/dev/pt3video12", PT1_CAP_S }, { "/dev/pt3video13", PT1_CAP_S },
++    { "/dev/pt3video14", PT1_CAP_T }, { "/dev/pt3video15", PT1_CAP_T },
++
++    /* PLEX PX4 (USB; hardwired split: 0,1,4,5 = S; 2,3,6,7 = T) */
++    { "/dev/px4video0",  PT1_CAP_S }, { "/dev/px4video1",  PT1_CAP_S },
++    { "/dev/px4video2",  PT1_CAP_T }, { "/dev/px4video3",  PT1_CAP_T },
++    { "/dev/px4video4",  PT1_CAP_S }, { "/dev/px4video5",  PT1_CAP_S },
++    { "/dev/px4video6",  PT1_CAP_T }, { "/dev/px4video7",  PT1_CAP_T },
++
++    /* PLEX PX4-DTV (USB; same split pattern, longer range) */
++    { "/dev/px4-DTV0",  PT1_CAP_S }, { "/dev/px4-DTV1",  PT1_CAP_S },
++    { "/dev/px4-DTV2",  PT1_CAP_T }, { "/dev/px4-DTV3",  PT1_CAP_T },
++    { "/dev/px4-DTV4",  PT1_CAP_S }, { "/dev/px4-DTV5",  PT1_CAP_S },
++    { "/dev/px4-DTV6",  PT1_CAP_T }, { "/dev/px4-DTV7",  PT1_CAP_T },
++    { "/dev/px4-DTV8",  PT1_CAP_S }, { "/dev/px4-DTV9",  PT1_CAP_S },
++    { "/dev/px4-DTV10", PT1_CAP_T }, { "/dev/px4-DTV11", PT1_CAP_T },
++    { "/dev/px4-DTV12", PT1_CAP_S }, { "/dev/px4-DTV13", PT1_CAP_S },
++    { "/dev/px4-DTV14", PT1_CAP_T }, { "/dev/px4-DTV15", PT1_CAP_T },
++    { "/dev/px4-DTV16", PT1_CAP_S }, { "/dev/px4-DTV17", PT1_CAP_S },
++    { "/dev/px4-DTV18", PT1_CAP_T }, { "/dev/px4-DTV19", PT1_CAP_T },
++    { "/dev/px4-DTV20", PT1_CAP_S }, { "/dev/px4-DTV21", PT1_CAP_S },
++    { "/dev/px4-DTV22", PT1_CAP_T }, { "/dev/px4-DTV23", PT1_CAP_T },
++    { "/dev/px4-DTV24", PT1_CAP_S }, { "/dev/px4-DTV25", PT1_CAP_S },
++    { "/dev/px4-DTV26", PT1_CAP_T }, { "/dev/px4-DTV27", PT1_CAP_T },
++    { "/dev/px4-DTV28", PT1_CAP_S }, { "/dev/px4-DTV29", PT1_CAP_S },
++    { "/dev/px4-DTV30", PT1_CAP_T }, { "/dev/px4-DTV31", PT1_CAP_T },
++
++    /* PLEX PX5 (USB; every chardev unified S+T) */
++    { "/dev/px5-DTV0",  PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV1",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV2",  PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV3",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV4",  PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV5",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV6",  PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV7",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV8",  PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV9",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV10", PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV11", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV12", PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV13", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV14", PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV15", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV16", PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV17", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV18", PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV19", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV20", PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV21", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV22", PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV23", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV24", PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV25", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV26", PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV27", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV28", PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV29", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/px5-DTV30", PT1_CAP_S | PT1_CAP_T }, { "/dev/px5-DTV31", PT1_CAP_S | PT1_CAP_T },
++
++    /* PLEX PX-MLT5PE (USB; 5 chardevs/card unified) */
++    { "/dev/pxmlt5video0",  PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt5video1",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt5video2",  PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt5video3",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt5video4",  PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt5video5",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt5video6",  PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt5video7",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt5video8",  PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt5video9",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt5video10", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt5video11", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt5video12", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt5video13", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt5video14", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt5video15", PT1_CAP_S | PT1_CAP_T },
++
++    /* PLEX PX-MLT8PE (USB; 8 chardevs/card unified) */
++    { "/dev/pxmlt8video0",  PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video1",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video2",  PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video3",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video4",  PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video5",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video6",  PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video7",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video8",  PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video9",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video10", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video11", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video12", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video13", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video14", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video15", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video16", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video17", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video18", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video19", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video20", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video21", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video22", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video23", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video24", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video25", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video26", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video27", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video28", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video29", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/pxmlt8video30", PT1_CAP_S | PT1_CAP_T }, { "/dev/pxmlt8video31", PT1_CAP_S | PT1_CAP_T },
++
++    /* Digibest ISDB6014 (USB; 4 chardevs/card unified) */
++    { "/dev/isdb6014video0",  PT1_CAP_S | PT1_CAP_T }, { "/dev/isdb6014video1",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/isdb6014video2",  PT1_CAP_S | PT1_CAP_T }, { "/dev/isdb6014video3",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/isdb6014video4",  PT1_CAP_S | PT1_CAP_T }, { "/dev/isdb6014video5",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/isdb6014video6",  PT1_CAP_S | PT1_CAP_T }, { "/dev/isdb6014video7",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/isdb6014video8",  PT1_CAP_S | PT1_CAP_T }, { "/dev/isdb6014video9",  PT1_CAP_S | PT1_CAP_T },
++    { "/dev/isdb6014video10", PT1_CAP_S | PT1_CAP_T }, { "/dev/isdb6014video11", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/isdb6014video12", PT1_CAP_S | PT1_CAP_T }, { "/dev/isdb6014video13", PT1_CAP_S | PT1_CAP_T },
++    { "/dev/isdb6014video14", PT1_CAP_S | PT1_CAP_T }, { "/dev/isdb6014video15", PT1_CAP_S | PT1_CAP_T },
++
++    /* Asicen ASV5220 (USB; hardwired split per chardev) */
++    { "/dev/asv52200",  PT1_CAP_S }, { "/dev/asv52201",  PT1_CAP_S },
++    { "/dev/asv52202",  PT1_CAP_T }, { "/dev/asv52203",  PT1_CAP_T },
++    { "/dev/asv52204",  PT1_CAP_S }, { "/dev/asv52205",  PT1_CAP_S },
++    { "/dev/asv52206",  PT1_CAP_T }, { "/dev/asv52207",  PT1_CAP_T },
++    { "/dev/asv52208",  PT1_CAP_S }, { "/dev/asv52209",  PT1_CAP_S },
++    { "/dev/asv522010", PT1_CAP_T }, { "/dev/asv522011", PT1_CAP_T },
++    { "/dev/asv522012", PT1_CAP_S }, { "/dev/asv522013", PT1_CAP_S },
++    { "/dev/asv522014", PT1_CAP_T }, { "/dev/asv522015", PT1_CAP_T },
++
++    /* PLEX PX-Q3PE (PCI; hardwired split per chardev) */
++    { "/dev/pxq3pe0",  PT1_CAP_S }, { "/dev/pxq3pe1",  PT1_CAP_S },
++    { "/dev/pxq3pe2",  PT1_CAP_T }, { "/dev/pxq3pe3",  PT1_CAP_T },
++    { "/dev/pxq3pe4",  PT1_CAP_S }, { "/dev/pxq3pe5",  PT1_CAP_S },
++    { "/dev/pxq3pe6",  PT1_CAP_T }, { "/dev/pxq3pe7",  PT1_CAP_T },
++    { "/dev/pxq3pe8",  PT1_CAP_S }, { "/dev/pxq3pe9",  PT1_CAP_S },
++    { "/dev/pxq3pe10", PT1_CAP_T }, { "/dev/pxq3pe11", PT1_CAP_T },
++    { "/dev/pxq3pe12", PT1_CAP_S }, { "/dev/pxq3pe13", PT1_CAP_S },
++    { "/dev/pxq3pe14", PT1_CAP_T }, { "/dev/pxq3pe15", PT1_CAP_T },
++
++    /* PLEX PXW3U4 / PXS3U (USB) */
++    { "/dev/pxw3u30", PT1_CAP_S }, { "/dev/pxw3u31", PT1_CAP_T },
++    { "/dev/pxw3u32", PT1_CAP_S }, { "/dev/pxw3u33", PT1_CAP_T },
++    { "/dev/pxs3u0",  PT1_CAP_S }, { "/dev/pxs3u1",   PT1_CAP_T },
++    { "/dev/pxs3u20", PT1_CAP_S }, { "/dev/pxs3u21",  PT1_CAP_T },
 +};
 +
 +const pt1_dev_info_t* is_pt1_dev_path(char const *path)
@@ -1441,18 +1560,400 @@
 +    }
 +}
 +
++/* ************************************************************************
++ * Adapter display-name resolver (linuxdvb-style "<name> #<idx>" labels)
++ * ***********************************************************************/
++
++/*
++ * Read a small sysfs attribute file into `buf` (NUL-terminated, trailing
++ * newline stripped). Returns the byte count on success or -1 on any error.
++ */
++static int pt1_read_sysfs_attr(const char *path, char *buf, size_t buflen)
++{
++    int fd, n;
++    if (buflen == 0) return -1;
++    fd = tvh_open(path, O_RDONLY, 0);
++    if (fd < 0) return -1;
++    n = (int)read(fd, buf, buflen - 1);
++    close(fd);
++    if (n <= 0) { buf[0] = '\0'; return -1; }
++    buf[n] = '\0';
++    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' ||
++                     buf[n - 1] == ' '  || buf[n - 1] == '\t')) {
++        buf[--n] = '\0';
++    }
++    return n;
++}
++
++/*
++ * Static lookup of known PCI cards by (vendor, device). The list is short
++ * by design — extend as IDs are confirmed against real hardware.
++ */
++typedef struct pt1_pci_id {
++    uint16_t vendor;
++    uint16_t device;
++    const char *name;
++} pt1_pci_id_t;
++
++static const pt1_pci_id_t pt1_pci_ids[] = {
++    { 0x1172, 0x4c15, "Earthsoft PT1" },
++    { 0x10ee, 0x222a, "Earthsoft PT3" },
++    { 0, 0, NULL }
++};
++
++/*
++ * Family-name fallback: maps a chardev basename prefix to a human label.
++ * Longest prefix wins, so e.g. "pxmlt8" matches before "px".
++ */
++typedef struct pt1_family_label {
++    const char *prefix;
++    const char *label;
++} pt1_family_label_t;
++
++static const pt1_family_label_t pt1_family_labels[] = {
++    { "pxmlt8",   "PLEX PX-MLT8PE"   },
++    { "pxmlt5",   "PLEX PX-MLT5PE"   },
++    { "pxq3pe",   "PLEX PX-Q3PE"     },
++    { "pxw3u",    "PLEX PXW3U4"      },
++    { "pxs3u",    "PLEX PXS3U"       },
++    { "px4-DTV",  "PLEX PX4"         },
++    { "px4video", "PLEX PX4"         },
++    { "px5-DTV",  "PLEX PX5"         },
++    { "isdb2056", "Digibest ISDB2056"},
++    { "isdb6014", "Digibest ISDB6014"},
++    { "asv522",   "Asicen ASV5220"   },
++    { "pt1video", "Earthsoft PT1"    },
++    { "pt3video", "Earthsoft PT3"    },
++    { NULL, NULL }
++};
++
++/*
++ * Per-label sequential counter. Grows as new labels are seen at init.
++ * Process-local; rebuilt every restart in deterministic discovery order.
++ */
++typedef struct pt1_label_counter {
++    char *label;
++    int   next_idx;
++} pt1_label_counter_t;
++
++#define PT1_MAX_LABELS 64
++static pt1_label_counter_t pt1_label_counters[PT1_MAX_LABELS];
++static int pt1_label_counter_count = 0;
++
++static int pt1_next_idx_for(const char *label)
++{
++    int i;
++    for (i = 0; i < pt1_label_counter_count; i++) {
++        if (!strcmp(pt1_label_counters[i].label, label)) {
++            return pt1_label_counters[i].next_idx++;
++        }
++    }
++    if (pt1_label_counter_count >= PT1_MAX_LABELS) return 0;
++    pt1_label_counters[pt1_label_counter_count].label    = strdup(label);
++    pt1_label_counters[pt1_label_counter_count].next_idx = 1;
++    pt1_label_counter_count++;
++    return 0;
++}
++
++/*
++ * Walk parent directories of `sysdir` (an absolute /sys/... path) up to
++ * the filesystem root, applying `probe` to each. Returns whatever `probe`
++ * returns on first non-zero value, or 0 if no parent matched.
++ */
++static int pt1_sysfs_walk_up(char *sysdir,
++                             int (*probe)(const char *dir, void *aux),
++                             void *aux)
++{
++    char *p;
++    int rc;
++    while ((rc = probe(sysdir, aux)) == 0) {
++        p = strrchr(sysdir, '/');
++        if (p == NULL || p == sysdir) return 0;
++        *p = '\0';
++        if (sysdir[0] == '\0') return 0;
++    }
++    return rc;
++}
++
++/*
++ * sysfs paths are short in practice (typical depth ~10 dirs, ~150 chars).
++ * Use a fixed 1 KiB buffer so attr-path concatenation stays inside the
++ * compiler's truncation-analysis bounds without PATH_MAX over-allocation.
++ */
++#define PT1_SYSFS_PATH_MAX 1024
++
++typedef struct pt1_probe_result {
++    char  buf[256];
++    int   matched;       /* 1=USB, 2=PCI */
++} pt1_probe_result_t;
++
++static int pt1_probe_usb_or_pci(const char *dir, void *aux)
++{
++    pt1_probe_result_t *r = aux;
++    char attr[PT1_SYSFS_PATH_MAX + 32];
++    char mfr[128], prod[128], vid_s[16], did_s[16];
++
++    /* USB: manufacturer + product strings */
++    snprintf(attr, sizeof(attr), "%s/manufacturer", dir);
++    if (pt1_read_sysfs_attr(attr, mfr, sizeof(mfr)) > 0) {
++        snprintf(attr, sizeof(attr), "%s/product", dir);
++        if (pt1_read_sysfs_attr(attr, prod, sizeof(prod)) > 0) {
++            snprintf(r->buf, sizeof(r->buf), "%s %s", mfr, prod);
++            r->matched = 1;
++            return 1;
++        }
++    }
++
++    /* PCI: vendor + device IDs */
++    snprintf(attr, sizeof(attr), "%s/vendor", dir);
++    if (pt1_read_sysfs_attr(attr, vid_s, sizeof(vid_s)) > 0) {
++        snprintf(attr, sizeof(attr), "%s/device", dir);
++        if (pt1_read_sysfs_attr(attr, did_s, sizeof(did_s)) > 0) {
++            unsigned vid = (unsigned)strtoul(vid_s, NULL, 16);
++            unsigned did = (unsigned)strtoul(did_s, NULL, 16);
++            const pt1_pci_id_t *p;
++            for (p = pt1_pci_ids; p->name != NULL; p++) {
++                if (p->vendor == vid && p->device == did) {
++                    snprintf(r->buf, sizeof(r->buf), "%s", p->name);
++                    r->matched = 2;
++                    return 2;
++                }
++            }
++            /* Known PCI device but unknown ID — note it and keep walking;
++             * a higher-priority sysfs ancestor might still match a known
++             * pattern (rare, but cheap to allow). */
++            tvhinfo(LS_PT1, "unknown PCI device %04x:%04x at %s",
++                    vid, did, dir);
++        }
++    }
++
++    return 0;
++}
++
++static const char *pt1_family_label_for(const char *basename)
++{
++    const pt1_family_label_t *f;
++    for (f = pt1_family_labels; f->prefix != NULL; f++) {
++        if (!strncmp(basename, f->prefix, strlen(f->prefix))) return f->label;
++    }
++    return NULL;
++}
++
++int pt1_make_adapter_label(const char *devpath, char *out, size_t outlen)
++{
++    struct stat st;
++    char syslink[64];
++    char sysdir[PT1_SYSFS_PATH_MAX];
++    char readbuf[PT1_SYSFS_PATH_MAX];
++    const char *basename;
++    const char *label = NULL;
++    pt1_probe_result_t pr;
++    ssize_t n;
++    int idx;
++
++    if (out == NULL || outlen == 0) return -1;
++    out[0] = '\0';
++
++    basename = strrchr(devpath, '/');
++    basename = basename ? basename + 1 : devpath;
++
++    /* Tier 1/2: sysfs walk from the chardev to its USB / PCI parent. */
++    memset(&pr, 0, sizeof(pr));
++    if (stat(devpath, &st) == 0 && S_ISCHR(st.st_mode)) {
++        snprintf(syslink, sizeof(syslink), "/sys/dev/char/%u:%u",
++                 (unsigned)major(st.st_rdev), (unsigned)minor(st.st_rdev));
++        n = readlink(syslink, readbuf, sizeof(readbuf) - 1);
++        if (n > 0) {
++            readbuf[n] = '\0';
++            /*
++             * readlink may return a relative path like "../../devices/...";
++             * pass it to realpath(NULL) so glibc allocates a PATH_MAX-sized
++             * buffer itself — handing realpath() a stack buffer < PATH_MAX
++             * is a stack-overrun bug (signal 6 / abort on -D_FORTIFY_SOURCE).
++             */
++            char abs[PT1_SYSFS_PATH_MAX];
++            int absn = snprintf(abs, sizeof(abs), "/sys/dev/char/%s", readbuf);
++            if (absn > 0 && absn < (int)sizeof(abs)) {
++                char *resolved = realpath(abs, NULL);
++                if (resolved != NULL) {
++                    if (strlen(resolved) < sizeof(sysdir)) {
++                        strcpy(sysdir, resolved);
++                        if (pt1_sysfs_walk_up(sysdir,
++                                              pt1_probe_usb_or_pci, &pr) > 0)
++                            label = pr.buf;
++                    }
++                    free(resolved);
++                }
++            }
++        }
++    }
++
++    /* Tier 3: family-name fallback by chardev basename. */
++    if (label == NULL) label = pt1_family_label_for(basename);
++
++    /* Tier 4: basename verbatim. */
++    if (label == NULL) {
++        tvhinfo(LS_PT1, "unknown sysfs lineage for %s, falling back to basename",
++                devpath);
++        label = basename;
++    }
++
++    idx = pt1_next_idx_for(label);
++    if (snprintf(out, outlen, "%s #%d", label, idx) >= (int)outlen) {
++        out[0] = '\0';
++        return -1;
++    }
++    return 0;
++}
++
++/* ************************************************************************
++ * Raw CN value → millibel (dB * 1000) conversion
++ * ***********************************************************************/
++
++/*
++ * cxd2856er internal CN encoding tables, transplanted from px4_drv's
++ * pxmlt_device.c (`isdbt_cn_raw_table[]` and `isdbs_cn_raw_table[]`). The
++ * kernel binary-searches its raw register reading against the .val column
++ * and hands us the matching .cn value via the PTX_GET_CNR ioctl — so we
++ * carry just the .cn column here and reverse-binary-search it back to a
++ * table index, then translate the index to dB.
++ *
++ *   ISDB-T : 49 entries, index 0 = 34.0 dB, step = -0.5 dB/index
++ *   ISDB-S : 192 entries, index 0 =  0.0 dB (no-lock), step = +0.1 dB/index
++ *
++ * Both columns are monotonic decreasing.
++ */
++static const uint32_t pt1_isdbt_cn_table[] = {
++    0xb19ff,0x9eecd,0x8cd8b,0x7c302,0x6f132,0x6250d,0x57a1c,0x4db45,0x45725,
++    0x3da59,0x36f9d,0x30e58,0x2b76e,0x26abb,0x22794,0x1eac7,0x1b4a8,0x1844d,
++    0x159a2,0x13365,0x11196,0xf3ae,0xd8cb,0xc0fd,0xabf9,0x9923,0x8868,0x7995,
++    0x6c78,0x60cf,0x5675,0x4d43,0x4520,0x3de4,0x377b,0x31cc,0x2cbf,0x2843,
++    0x2447,0x20bb,0x1d95,0x1ac6,0x1846,0x160a,0x140c,0x1243,0x10ab,0xf3c,
++    0xdf3
++};
++
++static const uint32_t pt1_isdbs_cn_table[] = {
++    0x9546,0x94d9,0x946b,0x93fc,0x938c,0x931b,0x92a8,0x9235,0x91c1,0x914b,
++    0x90d5,0x905d,0x8fe4,0x8f6a,0x8eef,0x8e72,0x8df5,0x8d76,0x8cf5,0x8c74,
++    0x8bf1,0x8b6c,0x8ae7,0x8a60,0x89d7,0x894d,0x88c2,0x8835,0x87a6,0x8716,
++    0x8685,0x85f1,0x855d,0x84c6,0x842e,0x8394,0x82f9,0x825b,0x81bc,0x811c,
++    0x8079,0x7fd5,0x7f2f,0x7e87,0x7ddd,0x7d31,0x7c83,0x7bd4,0x7b22,0x7a6f,
++    0x79ba,0x7903,0x784a,0x778f,0x76d3,0x7614,0x7554,0x7492,0x73ce,0x7308,
++    0x7241,0x7178,0x70ad,0x6fe1,0x6f13,0x6e44,0x6d74,0x6ca2,0x6bcf,0x6afb,
++    0x6a26,0x6950,0x687a,0x67a2,0x66ca,0x65f1,0x6517,0x643e,0x6364,0x628a,
++    0x61b0,0x60d6,0x5ffc,0x5f22,0x5e49,0x5d70,0x5c98,0x5bc0,0x5ae9,0x5a13,
++    0x593e,0x5869,0x5796,0x56c4,0x55f3,0x5523,0x5454,0x5387,0x52bb,0x51f0,
++    0x5126,0x505e,0x4f98,0x4ed3,0x4e0f,0x4d4d,0x4c8d,0x4bce,0x4b10,0x4a55,
++    0x499a,0x48e1,0x482a,0x4774,0x46c0,0x460d,0x455c,0x44ac,0x43fe,0x4352,
++    0x42a6,0x41fd,0x4154,0x40ae,0x4008,0x3f64,0x3ec2,0x3e21,0x3d81,0x3ce3,
++    0x3c46,0x3baa,0x3b10,0x3a77,0x39e0,0x394a,0x38b5,0x3821,0x378f,0x36fe,
++    0x366e,0x35e0,0x3553,0x34c7,0x343c,0x33b3,0x332b,0x32a4,0x321e,0x319a,
++    0x3116,0x3094,0x3014,0x2f94,0x2f16,0x2e99,0x2e1d,0x2da2,0x2d29,0x2cb0,
++    0x2c39,0x2bc4,0x2b4f,0x2adc,0x2a6a,0x29f9,0x2989,0x291a,0x28ad,0x2841,
++    0x27d6,0x276d,0x2705,0x269e,0x2638,0x25d3,0x2570,0x24ad,0x244d,0x23ef,
++    0x2336,0x22db,0x222a,0x217d,0x20d5,0x2083,0x1fe3,0x1f94,0x1efb,0x1e66,
++    0x1dd6,0x1d90
++};
++
++/*
++ * Reverse-lookup `raw` in a monotonic-decreasing table; return the index
++ * of the entry whose value is closest. Clamps to the endpoints.
++ */
++static int pt1_table_index_for_cn(const uint32_t *table, int n, uint32_t raw)
++{
++    int lo = 0, hi = n - 1;
++    if (raw >= table[0])     return 0;
++    if (raw <= table[hi])    return hi;
++    while (lo < hi - 1) {
++        int mid = lo + (hi - lo) / 2;
++        if (table[mid] == raw) return mid;
++        if (table[mid] > raw)  lo = mid;
++        else                   hi = mid;
++    }
++    /* table[lo] >= raw >= table[hi]; pick the closer of the two */
++    return (table[lo] - raw) <= (raw - table[hi]) ? lo : hi;
++}
++
++static int pt1_path_is_old_earthsoft(const char *path)
++{
++    const char *base = strrchr(path, '/');
++    base = base ? base + 1 : path;
++    return !strncmp(base, "pt1video", 8) || !strncmp(base, "pt3video", 8);
++}
++
++int pt1_cn_to_millibel(const char *path, dvb_fe_type_t type, uint32_t raw)
++{
++    /*
++     * Old Earthsoft PT1/PT2/PT3 chip: GET_SIGNAL_STRENGTH returns a 24-bit
++     * raw register value. Apply the recpt1 polynomial.
++     */
++    if (pt1_path_is_old_earthsoft(path)) {
++        if (raw == 0) return INT_MIN;   /* divide-by-zero guard */
++        if (type == DVB_TYPE_ISDB_T) {
++            double P = log10(5505024.0 / (double)raw) * 10.0;
++            double CNR = (0.000024 * P * P * P * P) - (0.0016 * P * P * P) +
++                         (0.0398 * P * P) + (0.5491 * P) + 3.0965;
++            return (int)(CNR * 1000.0);
++        }
++        /* ISDB-S on the old chip: recpt1's linear-interpolation lookup.
++         * The kernel returns the value as-is (raw register, not pre-converted),
++         * so we replicate recpt1::getsignal_isdb_s. */
++        static const float lut[] = {
++            24.07f, 24.07f, 18.61f, 15.21f, 12.50f, 10.19f, 8.140f,
++             6.270f, 4.550f, 3.730f, 3.630f, 2.940f, 1.420f, 0.000f
++        };
++        unsigned char b0 = (raw >> 8) & 0xff;
++        unsigned char b1 = raw & 0xff;
++        float cnr;
++        if (b0 <= 0x10) cnr = 24.07f;
++        else if (b0 >= 0xb0) cnr = 0.0f;
++        else {
++            float mix = (float)(((b0 & 0x0f) << 8) | b0) / 4096.0f;
++            cnr = lut[b0 >> 4] * (1.0f - mix) + lut[(b0 >> 4) + 1] * mix;
++        }
++        (void)b1;
++        return (int)(cnr * 1000.0f);
++    }
++
++    /*
++     * px4_drv (cxd2856er) chardev: PTX_GET_CNR returns a table-encoded `cn`
++     * already, not a raw register. Reverse-binary-search our copy of the
++     * kernel's table to recover the dB.
++     */
++    if (type == DVB_TYPE_ISDB_T) {
++        int i = pt1_table_index_for_cn(pt1_isdbt_cn_table,
++                                       (int)(sizeof(pt1_isdbt_cn_table) /
++                                             sizeof(*pt1_isdbt_cn_table)), raw);
++        /* index 0 = 34.0 dB, step -0.5 dB per index */
++        return 34000 - i * 500;
++    } else {
++        int i = pt1_table_index_for_cn(pt1_isdbs_cn_table,
++                                       (int)(sizeof(pt1_isdbs_cn_table) /
++                                             sizeof(*pt1_isdbs_cn_table)), raw);
++        /* index 0 = 0.0 dB (no-lock), step +0.1 dB per index */
++        return 0 + i * 100;
++    }
++}
 --- /dev/null
 +++ b/src/input/mpegts/pt1/pt1_dev.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,83 @@
 +#ifndef _PT1_DEV_H_
 +#define _PT1_DEV_H_
 +#include "../dvb.h"
 +#include "pt1_ioctl.h"
 +
++/*
++ * Capability bitmask. A chardev is "hardwired" when only one bit is set;
++ * "unified" chardevs (PX5 / PXMLT5 / PXMLT8 / ISDB6014) set both bits and
++ * pick the delivery system at tune time via PTX_SET_SYSTEM_MODE.
++ */
++#define PT1_CAP_T   (1u << 0)   /* chardev supports ISDB-T */
++#define PT1_CAP_S   (1u << 1)   /* chardev supports ISDB-S */
++
 +struct pt1_dev_info
 +{
 +    const char *path;
-+    dvb_fe_type_t type;
++    uint32_t    system_cap;     /* PT1_CAP_T | PT1_CAP_S (or both) */
 +};
 +
 +typedef struct pt1_dev_info pt1_dev_info_t;
@@ -1477,6 +1978,46 @@
 + */
 +int pt1_resolve_freq(uint32_t freq, int stream_id,
 +                     dvb_fe_type_t type, FREQUENCY *out);
++
++/*
++ * Resolve a chardev path (e.g. "/dev/pt3video0") into a human-readable
++ * adapter label that mirrors linuxdvb's "<name> #<idx>" convention, e.g.
++ * "Earthsoft PT3 #0" or "PLEX PX-MLT8PE #2".
++ *
++ * Tier 1: walk sysfs from the chardev's (major,minor) to its USB parent
++ *         and concatenate the kernel's `manufacturer`+`product` strings.
++ * Tier 2: same walk to a PCI parent; look up vendor:device in a small
++ *         static table of known PT cards.
++ * Tier 3: extract a family token from the chardev basename and look up
++ *         in a static family-name table.
++ * Tier 4: use the chardev basename verbatim.
++ *
++ * Appends a sequential "#N" derived from a per-label counter that
++ * persists for the lifetime of the process. Writes the final label into
++ * `out` (NUL-terminated). Returns 0 on success; the only error is an
++ * undersized buffer, in which case `out` is left empty and -1 returned.
++ */
++int pt1_make_adapter_label(const char *devpath, char *out, size_t outlen);
++
++/*
++ * Convert the kernel's raw CN reading from GET_SIGNAL_STRENGTH into a
++ * signed millibel (dB * 1000) value.
++ *
++ *   PT1 / PT3 chardevs use the historic Earthsoft chip — `raw` is a 24-bit
++ *     register; the conversion is the 5505024-based polynomial used by
++ *     recpt1.
++ *   px4_drv chardevs (PX4 / PX5 / PXMLT5 / PXMLT8 / ISDB6014) — `raw` is
++ *     already a cxd2856er CN value the kernel produced by table-lookup
++ *     ("10..34 dB / 0.5 dB" for ISDB-T, "0..20 dB / 0.1 dB" for ISDB-S).
++ *     We reverse-lookup our own copy of those tables to recover the dB.
++ *
++ * `path` is the chardev (`/dev/pt3video0`, `/dev/pxmlt8video1`, …) and
++ * picks which conversion to apply.
++ *
++ * Returns dB * 1000 on success, or `INT_MIN` if the raw value is out of
++ * the supported range for the chip family.
++ */
++int pt1_cn_to_millibel(const char *path, dvb_fe_type_t type, uint32_t raw);
 +
 +#endif
 --- /dev/null
