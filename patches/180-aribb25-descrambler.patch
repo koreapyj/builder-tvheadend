@@ -1,6 +1,6 @@
 --- a/Makefile
 +++ b/Makefile
-@@ -612,6 +612,12 @@ SRCS-CONSTCW = \
+@@ -605,6 +605,12 @@ SRCS-CONSTCW = \
  SRCS-${CONFIG_CONSTCW} += $(SRCS-CONSTCW)
  I18N-C += $(SRCS-CONSTCW)
  
@@ -15,7 +15,7 @@
          src/input/mpegts/en50221/en50221.c \
 --- a/configure
 +++ b/configure
-@@ -64,6 +64,7 @@ OPTIONS=(
+@@ -63,6 +63,7 @@ OPTIONS=(
    "pcre2:auto"
    "uriparser:auto"
    "aribb24:auto"
@@ -23,7 +23,7 @@
    "ccache:auto"
    "tvhcsa:auto"
    "bundle:no"
-@@ -566,6 +567,17 @@ if enabled_or_auto aribb24; then
+@@ -564,6 +565,17 @@ if enabled_or_auto aribb24; then
    fi
  fi
  
@@ -43,7 +43,7 @@
  #
 --- /dev/null
 +++ b/src/descrambler/aribb25.c
-@@ -0,0 +1,549 @@
+@@ -0,0 +1,662 @@
 +/*
 + *  Tvheadend - ARIB STD-B25 descrambler via libaribb25
 + *
@@ -73,6 +73,13 @@
 +#include "sbuf.h"
 +#include "descrambler/descrambler.h"
 +#include "descrambler/caid.h"
++
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <poll.h>
++#include <pthread.h>
 +
 +#include <aribb25/arib_std_b25.h>
 +#include <aribb25/b_cas_card.h>
@@ -118,7 +125,6 @@
 +  int    ab_process_emm;
 +  int    ab_multi2_round;
 +  char  *ab_cobalt_card_image_path;
-+  char  *ab_cobalt_log_file_path;
 +  int    ab_cobalt_log_mode;
 +
 +  LIST_HEAD(, aribb25_mux) ab_muxes;
@@ -185,6 +191,118 @@
 +  return outlen;
 +}
 +
++/* ************************************************************************
++ * CobaltCas log redirection
++ *
++ * CobaltCas's only log sink is a regular file at sys.LOG_FILE_NAME. To
++ * route those messages into tvheadend's log we point it at a FIFO and
++ * spawn a reader thread that drains the FIFO and emits each line via
++ * tvhlog (LS_ARIBB25, prefix "cobaltcas:"). Setup happens once per
++ * process, the first time aribb25 with the cobalt backend is brought up.
++ * ***********************************************************************/
++
++static pthread_once_t aribb25_cobalt_log_once = PTHREAD_ONCE_INIT;
++static char           aribb25_cobalt_log_path[256];
++static int            aribb25_cobalt_log_fd = -1;
++static pthread_t      aribb25_cobalt_log_thread;
++static int            aribb25_cobalt_log_thread_started = 0;
++
++static void *
++aribb25_cobalt_log_reader ( void *aux )
++{
++  char buf[4096];
++  char line[1024];
++  size_t line_len = 0;
++
++  while (tvheadend_is_running()) {
++    struct pollfd pfd = { .fd = aribb25_cobalt_log_fd, .events = POLLIN };
++    int pr = poll(&pfd, 1, 500);   /* 500 ms — coarse enough for shutdown */
++    if (pr < 0) {
++      if (errno == EINTR) continue;
++      break;
++    }
++    if (pr == 0) continue;
++    if (!(pfd.revents & POLLIN)) continue;
++
++    ssize_t n = read(aribb25_cobalt_log_fd, buf, sizeof(buf));
++    if (n <= 0) {
++      if (n < 0 && errno == EINTR) continue;
++      if (n < 0 && errno == EAGAIN) continue;
++      break;
++    }
++    for (ssize_t i = 0; i < n; i++) {
++      char c = buf[i];
++      if (c == '\n' || line_len >= sizeof(line) - 1) {
++        line[line_len] = '\0';
++        if (line_len > 0)
++          tvhinfo(LS_ARIBB25, "cobaltcas: %s", line);
++        line_len = 0;
++        if (c != '\n' && c != '\r') line[line_len++] = c;
++      } else if (c != '\r') {
++        line[line_len++] = c;
++      }
++    }
++  }
++  return NULL;
++}
++
++static void
++aribb25_cobalt_log_init_once ( void )
++{
++  /* PID-tagged path so multiple tvheadend processes don't collide. */
++  snprintf(aribb25_cobalt_log_path, sizeof(aribb25_cobalt_log_path),
++           "/tmp/tvh-cobaltcas-%d.fifo", (int)getpid());
++
++  /* Best-effort cleanup of a stale FIFO from a previous run with the same
++   * PID; ignore errors. */
++  unlink(aribb25_cobalt_log_path);
++
++  if (mkfifo(aribb25_cobalt_log_path, 0600) != 0) {
++    tvherror(LS_ARIBB25, "cobaltcas: mkfifo(%s) failed: %s",
++             aribb25_cobalt_log_path, strerror(errno));
++    aribb25_cobalt_log_path[0] = '\0';
++    return;
++  }
++
++  /* O_RDWR keeps the FIFO open from both sides so CobaltCas's repeated
++   * ofstream open/close cycles never see "no reader" and never block. */
++  aribb25_cobalt_log_fd = open(aribb25_cobalt_log_path,
++                               O_RDWR | O_NONBLOCK | O_CLOEXEC);
++  if (aribb25_cobalt_log_fd < 0) {
++    tvherror(LS_ARIBB25, "cobaltcas: open(%s) failed: %s",
++             aribb25_cobalt_log_path, strerror(errno));
++    unlink(aribb25_cobalt_log_path);
++    aribb25_cobalt_log_path[0] = '\0';
++    return;
++  }
++
++  if (tvh_thread_create(&aribb25_cobalt_log_thread, NULL,
++                        aribb25_cobalt_log_reader, NULL,
++                        "aribb25-coblog") != 0) {
++    tvherror(LS_ARIBB25, "cobaltcas: log reader thread create failed");
++    close(aribb25_cobalt_log_fd);
++    aribb25_cobalt_log_fd = -1;
++    unlink(aribb25_cobalt_log_path);
++    aribb25_cobalt_log_path[0] = '\0';
++    return;
++  }
++  aribb25_cobalt_log_thread_started = 1;
++  tvhdebug(LS_ARIBB25, "cobaltcas: log routed to tvheadend via %s",
++           aribb25_cobalt_log_path);
++}
++
++/*
++ * Returns the FIFO path that CobaltCas should write its log to. Empty
++ * string on init failure (caller should fall back to the user-configured
++ * path so the operator at least has something).
++ */
++static const char *
++aribb25_cobalt_log_fifo ( void )
++{
++  pthread_once(&aribb25_cobalt_log_once, aribb25_cobalt_log_init_once);
++  return aribb25_cobalt_log_path[0] ? aribb25_cobalt_log_path : NULL;
++}
++
 +static aribb25_mux_t *
 +aribb25_mux_create ( aribb25_t *ab, mpegts_mux_t *mux )
 +{
@@ -209,10 +327,15 @@
 +  am->am_b25->set_unit_size(am->am_b25, 188);
 +
 +  if (ab->ab_card_backend == ARIBB25_BACKEND_COBALT) {
-+    b_cas_cobalt_set_card_image_path(ab->ab_cobalt_card_image_path);
-+    b_cas_cobalt_set_log_file_path(ab->ab_cobalt_log_file_path);
-+    b_cas_cobalt_set_log_mode(ab->ab_cobalt_log_mode);
 +    am->am_bcas = create_b_cas_cobalt();
++    /* create_b_cas_cobalt() resets sys.{CARD_IMAGE_FILE_NAME,LOG_FILE_NAME,
++     * logMode} to its built-in defaults at the end of the call, so the
++     * configurable setters MUST run after it, not before, to take effect.
++     * Route CobaltCas's file-based logger through a FIFO so its messages
++     * land in tvheadend's log. */
++    b_cas_cobalt_set_card_image_path(ab->ab_cobalt_card_image_path);
++    b_cas_cobalt_set_log_file_path(aribb25_cobalt_log_fifo());
++    b_cas_cobalt_set_log_mode(ab->ab_cobalt_log_mode);
 +  } else {
 +    am->am_bcas = create_b_cas_card();
 +  }
@@ -476,7 +599,6 @@
 +  tvh_mutex_unlock(&ab->ab_lock);
 +
 +  free(ab->ab_cobalt_card_image_path);
-+  free(ab->ab_cobalt_log_file_path);
 +  tvh_mutex_destroy(&ab->ab_lock);
 +}
 +
@@ -538,15 +660,6 @@
 +                   "Blue Card data on first use, and persists state across "
 +                   "restarts. Only used when the card backend is CobaltCas."),
 +      .off    = offsetof(aribb25_t, ab_cobalt_card_image_path),
-+      .group  = 3,
-+    },
-+    {
-+      .type   = PT_STR,
-+      .id     = "cobalt_log_file",
-+      .name   = N_("Log file"),
-+      .desc   = N_("Optional path to a CobaltCas log file."),
-+      .off    = offsetof(aribb25_t, ab_cobalt_log_file_path),
-+      .opts   = PO_ADVANCED,
 +      .group  = 3,
 +    },
 +    {
@@ -698,7 +811,7 @@
 -               'nodeid,version,limit,caid_select,caid_list,multi';
 +               'nodeid,version,limit,caid_select,caid_list,multi,' +
 +               'card_backend,process_emm,cobalt_card_image,' +
-+               'cobalt_log_file,cobalt_log_mode,multi2_round';
++               'cobalt_log_mode,multi2_round';
  
      tvheadend.idnode_form_grid(panel, {
          clazz: 'caclient',
