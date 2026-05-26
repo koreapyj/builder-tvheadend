@@ -1,5 +1,7 @@
---- a/src/input/mpegts.h
-+++ b/src/input/mpegts.h
+Index: src/src/input/mpegts.h
+===================================================================
+--- src.orig/src/input/mpegts.h
++++ src/src/input/mpegts.h
 @@ -578,6 +578,7 @@ struct mpegts_service
    char    *s_dvb_provider;
    char    *s_dvb_cridauth;
@@ -8,8 +10,10 @@
    int      s_dvb_ignore_eit;
    int      s_dvb_subtitle_processing;       //Various options for replacing/augmenting the desc from the sub-title
    int      s_dvb_ignore_matching_subtitle;  //Ignore the sub-title if same as title
---- a/src/input/mpegts/dvb.h
-+++ b/src/input/mpegts/dvb.h
+Index: src/src/input/mpegts/dvb.h
+===================================================================
+--- src.orig/src/input/mpegts/dvb.h
++++ src/src/input/mpegts/dvb.h
 @@ -48,6 +48,7 @@ struct lang_str;
  #define DVB_TDT_PID                   0x14
  #define DVB_SNC_PID                   0x15
@@ -36,8 +40,10 @@
  #define DVB_DESC_ARIB_SERIES          0xD5
  #define DVB_DESC_ARIB_EVENT_GROUP     0xD6
  #define DVB_DESC_DATA_COMPONENT       0xFD
---- a/src/input/mpegts/dvb_psi.c
-+++ b/src/input/mpegts/dvb_psi.c
+Index: src/src/input/mpegts/dvb_psi.c
+===================================================================
+--- src.orig/src/input/mpegts/dvb_psi.c
++++ src/src/input/mpegts/dvb_psi.c
 @@ -23,6 +23,8 @@
  #include "tsdemux.h"
  #include "lang_codes.h"
@@ -47,7 +53,7 @@
  #include "dvb_charset.h"
  #include "bouquet.h"
  #include "fastscan.h"
-@@ -1611,6 +1613,196 @@ dvberr:
+@@ -1611,6 +1613,202 @@ dvberr:
    return -1;
  }
  
@@ -201,31 +207,37 @@
 +static int
 +dvb_cdt_callback ( mpegts_table_t *mt, const uint8_t *ptr, int len, int tableid )
 +{
-+  int r, sect, last, ver, seclen, total, dll, dmlen, data_size;
++  /* ptr starts at sec+3 (download_data_id); len = section_length - 4 (CRC stripped).
++   *   ptr[0..1]     download_data_id
++   *   ptr[2]        reserved + version + current_next
++   *   ptr[3]        section_number       (consumed by dvb_table_begin)
++   *   ptr[4]        last_section_number  (consumed by dvb_table_begin)
++   *   ptr[5..6]     original_network_id
++   *   ptr[7]        data_type (0x01 = logo)
++   *   ptr[8..9]     reserved + descriptors_loop_length (12-bit dll)
++   *   ptr[10..]     descriptors
++   *   ptr[10+dll..] data_module_byte
++   */
++  int r, sect, last, ver, dll, dmlen, data_size;
 +  uint16_t download_data_id, onid, logo_id;
 +  const uint8_t *dm;
 +  mpegts_psi_table_state_t *st = NULL;
 +
-+  if (tableid != DVB_CDT_BASE || len < 24)
++  if (tableid != DVB_CDT_BASE || len < 17)
 +    return -1;
-+  download_data_id = extract_2byte(ptr + 3);
++  download_data_id = extract_2byte(ptr);
 +  r = dvb_table_begin((mpegts_psi_table_t *)mt, ptr, len, tableid,
-+                      download_data_id, 13, &st, &sect, &last, &ver, 0);
++                      download_data_id, 10, &st, &sect, &last, &ver, 0);
 +  if (r != 1)
 +    return r;
 +
-+  seclen = ((ptr[1] & 0x0f) << 8) | ptr[2];
-+  total  = seclen + 3;
-+  if (total > len || total < 24)
++  onid = extract_2byte(ptr + 5);
++  dll  = ((ptr[8] & 0x0f) << 8) | ptr[9];
++  if (ptr[7] != 0x01 || 10 + dll + 7 > len)          /* data_type 0x01 = logo */
 +    goto done;
 +
-+  onid = extract_2byte(ptr + 8);
-+  dll  = ((ptr[11] & 0x0f) << 8) | ptr[12];
-+  if (ptr[10] != 0x01 || 13 + dll + 7 + 4 > total)   /* data_type 0x01 = logo */
-+    goto done;
-+
-+  dm    = ptr + 13 + dll;
-+  dmlen = total - 4 - (13 + dll);
++  dm    = ptr + 10 + dll;
++  dmlen = len - 10 - dll;
 +
 +  /* logo data module: logo_type(8) res(7) logo_id(9) res(4) logo_version(12)
 +   *                    data_size(16) data_byte[] */
@@ -244,7 +256,7 @@
  /**
   * DVB SDT (Service Description Table)
   */
-@@ -1634,6 +1826,9 @@ dvb_sdt_mux
+@@ -1634,6 +1832,9 @@ dvb_sdt_mux
      uint16_t service_id                = extract_svcid(ptr);
      int      free_ca_mode              = (ptr[3] >> 4) & 0x1;
      int      stype = 0;
@@ -254,7 +266,7 @@
      char     sprov[256], sname[256], sauth[256];
      int      running_status            = (ptr[3] >> 5) & 0x7;
      const char *charset;
-@@ -1676,6 +1871,13 @@ dvb_sdt_mux
+@@ -1676,6 +1877,13 @@ dvb_sdt_mux
              if (dvb_get_string(sname, sizeof(sname), dptr, dlen, charset, NULL))
                tvhtrace(mt->mt_subsys, "%s:      bskyb nvod error", mt->mt_name);
            break;
@@ -268,7 +280,7 @@
        }
      }}
  
-@@ -1695,8 +1897,18 @@ dvb_sdt_mux
+@@ -1695,8 +1903,18 @@ dvb_sdt_mux
        if ((r = dvb_servicetype_lookup(stype)) != -1)
          s->s_servicetype = r;
      }
@@ -289,7 +301,7 @@
       * Some networks appear to provide diff service names on diff transponders
       */
      if (tableid == 0x42 || mm == mm_orig)
-@@ -2263,6 +2475,10 @@ psi_tables_dvb ( mpegts_mux_t *mm )
+@@ -2263,6 +2481,10 @@ psi_tables_dvb ( mpegts_mux_t *mm )
                     DVB_SDT_PID, MPS_WEIGHT_SDT);
    mpegts_table_add(mm, DVB_BAT_BASE, DVB_BAT_MASK, dvb_bat_callback,
                     NULL, "bat", LS_TBL_BASE, MT_CRC, DVB_BAT_PID, MPS_WEIGHT_BAT);

@@ -1,5 +1,7 @@
---- a/src/input/mpegts/dvb.h
-+++ b/src/input/mpegts/dvb.h
+Index: src/src/input/mpegts/dvb.h
+===================================================================
+--- src.orig/src/input/mpegts/dvb.h
++++ src/src/input/mpegts/dvb.h
 @@ -370,6 +370,12 @@ int dvb_table_begin
  void dvb_table_reset (mpegts_psi_table_t *mt);
  void dvb_table_release (mpegts_psi_table_t *mt);
@@ -13,9 +15,11 @@
  /* all-in-one parser */
  
  typedef void (*mpegts_psi_parse_callback_t)
---- a/src/input/mpegts/dvb_psi.c
-+++ b/src/input/mpegts/dvb_psi.c
-@@ -1801,6 +1801,242 @@ dvb_cdt_callback ( mpegts_table_t *mt, c
+Index: src/src/input/mpegts/dvb_psi.c
+===================================================================
+--- src.orig/src/input/mpegts/dvb_psi.c
++++ src/src/input/mpegts/dvb_psi.c
+@@ -1807,6 +1807,249 @@ dvb_cdt_callback ( mpegts_table_t *mt, c
  done:
    return dvb_table_end((mpegts_psi_table_t *)mt, st, sect);
  }
@@ -227,23 +231,30 @@
 +  }
 +}
 +
-+/* DSM-CC section handler for a logo carousel ES (table_id 0x3B / 0x3C). */
++/* DSM-CC section handler for a logo carousel ES (table_id 0x3B / 0x3C).
++ *
++ * ptr starts at sec+3 (no MT_FULL), len = section_length - 4 (CRC stripped):
++ *   ptr[0..1]  table_id_extension
++ *   ptr[2]     reserved + version + current_next
++ *   ptr[3]     section_number
++ *   ptr[4]     last_section_number
++ *   ptr[5..]   DSM-CC message header (protocol_discriminator, dsmccType,
++ *              messageId, transactionId, reserved, adaptationLength,
++ *              messageLength, ...) - what isdb_dsmcc_dii/_ddb expect.
++ */
 +static int
 +dvb_dsmcc_callback ( mpegts_table_t *mt, const uint8_t *ptr, int len, int tableid )
 +{
-+  int total, paylen;
++  int paylen;
 +
-+  if ((tableid != 0x3B && tableid != 0x3C) || len < 12)
++  if ((tableid != 0x3B && tableid != 0x3C) || len < 17)
 +    return 0;
-+  total = (((ptr[1] & 0x0f) << 8) | ptr[2]) + 3;
-+  if (total > len || total < 16)
-+    return 0;
-+  paylen = total - 8 - 4;               /* drop 8-byte header and CRC */
++  paylen = len - 5;
 +  if (paylen >= 12) {
 +    if (tableid == 0x3B)
-+      isdb_dsmcc_dii(ptr + 8, paylen);
++      isdb_dsmcc_dii(ptr + 5, paylen);
 +    else
-+      isdb_dsmcc_ddb(mt, ptr + 8, paylen);
++      isdb_dsmcc_ddb(mt, ptr + 5, paylen);
 +  }
 +  return 0;
 +}
@@ -258,8 +269,10 @@
  #endif /* ENABLE_ARIBB24 */
  
  /**
---- a/src/input/mpegts/dvb_psi_pmt.c
-+++ b/src/input/mpegts/dvb_psi_pmt.c
+Index: src/src/input/mpegts/dvb_psi_pmt.c
+===================================================================
+--- src.orig/src/input/mpegts/dvb_psi_pmt.c
++++ src/src/input/mpegts/dvb_psi_pmt.c
 @@ -470,6 +470,15 @@ dvb_psi_parse_pmt
            hts_stream_type = SCT_ARIBSUB;
          break;
