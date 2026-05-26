@@ -6,15 +6,27 @@ TVH_REF     ?= master
 BUILD_IMAGE ?= ubuntu:noble
 QUILT       ?=
 
+# Pre-built builder image — bakes apt deps + libaribb25 + CobaltCas so
+# subsequent `make build` / `make run` skip the 60–130s preamble.
+BUILDER_IMAGE ?= tvheadend-builder:noble
+DOCKERFILE    := support/Dockerfile.builder
+IMAGE_STAMP   := .image-stamp
+
+LIBARIBB25_REPO ?= https://github.com/koreapyj/libaribb25.git
+LIBARIBB25_REF  ?= master
+COBALTCAS_REF   ?= master
+
 SRC     := src
 PATCHES := patches
 QUILTRC := $(CURDIR)/.quiltrc
 
 # Minimal dependency set — enough to compile a runnable tvheadend, nothing for
-# transcoding or Debian packaging.
+# transcoding or Debian packaging. Mirror in support/Dockerfile.builder
+# (kept in sync via the image-stamp digest below).
 BUILD_DEPS := build-essential cmake git pkg-config gettext libavahi-client-dev \
               libssl-dev zlib1g-dev liburiparser-dev libpcre2-dev libdvbcsa-dev \
-              libaribb24-dev libpcsclite-dev python3 wget bzip2 ca-certificates
+              libaribb24-dev libpcsclite-dev libpcsclite1 python3 wget bzip2 \
+              ca-certificates
 
 # Minimal configure flags — fast, offline, no transcoding / DVB-scan fetch.
 # --prefix=/usr puts TVHEADEND_DATADIR at /usr/share/tvheadend, matching the
@@ -25,13 +37,12 @@ BUILD_CONFIGURE := --prefix=/usr \
                    --disable-libav --disable-dvbscan --enable-aribb24 \
                    --python=python3
 
-# Runtime shared libraries needed to *run* the test binary. The -dev package
-# names are stable across releases and pull in the correct SONAME packages.
-RUN_DEPS := libavahi-client-dev libssl-dev zlib1g-dev liburiparser-dev \
-            libpcre2-dev libdvbcsa-dev libaribb24-dev libpcsclite1
+# Inputs whose change should trigger a builder-image rebuild.
+IMAGE_INPUTS := $(DOCKERFILE) support/build-libaribb25.sh
+IMAGE_DIGEST  = $(shell { cat $(IMAGE_INPUTS); printf '%s\n' '$(BUILD_IMAGE)' '$(BUILD_DEPS)' '$(LIBARIBB25_REPO)' '$(LIBARIBB25_REF)' '$(COBALTCAS_REF)'; } | sha256sum | cut -d' ' -f1)
 
 .DEFAULT_GOAL := help
-.PHONY: help prepare build run update refresh clean
+.PHONY: help prepare image force-image build run update refresh clean clean-image
 
 help:
 	@echo 'Local patch-authoring / test-build workflow (not used by CI).'
@@ -39,13 +50,18 @@ help:
 	@echo 'Targets:'
 	@echo '  prepare [QUILT=1]  clone tvheadend into $(SRC)/; default applies the patch'
 	@echo '                     series with git apply, QUILT=1 stages a quilt working series'
+	@echo '  image              build/refresh the builder docker image (idempotent)'
+	@echo '  force-image        rebuild builder image even if stamp matches'
 	@echo '  build              lightweight test build -> $(SRC)/build.linux/tvheadend'
 	@echo '  run                run the freshly built binary (web UI on http://localhost:9981)'
 	@echo '  update             copy the edited series from $(SRC)/$(PATCHES)/ back to $(PATCHES)/'
 	@echo '  refresh            rebase the whole series against current source, then update'
-	@echo '  clean              remove $(SRC)/'
+	@echo '  clean              remove $(SRC)/ and image-stamp'
+	@echo '  clean-image        remove the builder docker image'
 	@echo
 	@echo 'Variables: TVH_REF (default master), TVH_REPO, BUILD_IMAGE (default ubuntu:noble)'
+	@echo '           BUILDER_IMAGE (default $(BUILDER_IMAGE))'
+	@echo '           LIBARIBB25_REPO / LIBARIBB25_REF / COBALTCAS_REF'
 	@echo
 	@echo 'Patch workflow:  make clean prepare QUILT=1  ->  edit with quilt  ->  make update'
 	@echo 'Test build:      make clean prepare build  ->  make run'
@@ -74,19 +90,44 @@ else
 	done
 endif
 
-build:
+# Build the builder image if its inputs changed (digest stamp + local image
+# presence check). Idempotent: a no-op when nothing relevant changed.
+image:
+	@set -e; \
+	digest="$(IMAGE_DIGEST)"; \
+	stamp=$$(cat $(IMAGE_STAMP) 2>/dev/null || true); \
+	if [ "$$stamp" = "$$digest" ] && docker image inspect $(BUILDER_IMAGE) >/dev/null 2>&1; then \
+		exit 0; \
+	fi; \
+	echo "Building $(BUILDER_IMAGE) (digest $$digest)..."; \
+	DOCKER_BUILDKIT=1 docker build \
+		-f $(DOCKERFILE) \
+		-t $(BUILDER_IMAGE) \
+		--build-arg BASE=$(BUILD_IMAGE) \
+		--build-arg LIBARIBB25_REPO=$(LIBARIBB25_REPO) \
+		--build-arg LIBARIBB25_REF=$(LIBARIBB25_REF) \
+		--build-arg COBALTCAS_REF=$(COBALTCAS_REF) \
+		support/; \
+	printf '%s\n' "$$digest" > $(IMAGE_STAMP); \
+	echo "Builder image ready."
+
+force-image:
+	@rm -f $(IMAGE_STAMP)
+	@$(MAKE) image
+
+build: image
 	@test -d $(SRC) || { echo "No $(SRC)/ — run 'make prepare' (or 'make prepare QUILT=1') first"; exit 1; }
-	docker run --rm -e DEBIAN_FRONTEND=noninteractive \
-		-v "$(CURDIR):/ws" -w /ws/$(SRC) "$(BUILD_IMAGE)" \
-		bash -euxc 'apt-get update -y && apt-get install -y $(BUILD_DEPS) && PREFIX=/usr bash /ws/support/build-libaribb25.sh && git config --global --add safe.directory "*" && ./configure $(BUILD_CONFIGURE) && make -j"$$(nproc)" && chown -R "$$(stat -c %u:%g /ws)" .'
+	docker run --rm \
+		-v "$(CURDIR):/ws" -w /ws/$(SRC) "$(BUILDER_IMAGE)" \
+		bash -euxc './configure $(BUILD_CONFIGURE) && make -j"$$(nproc)" && chown -R "$$(stat -c %u:%g /ws)" .'
 	@echo
 	@echo 'Built: $(SRC)/build.linux/tvheadend'
 
-run:
+run: image
 	@test -x $(SRC)/build.linux/tvheadend || { echo "Not built — run 'make build' first"; exit 1; }
-	docker run --rm -it -p 9981:9981 -e DEBIAN_FRONTEND=noninteractive \
-		-v "$(CURDIR):/ws" -w /ws/$(SRC) "$(BUILD_IMAGE)" \
-		bash -c 'apt-get update -y >/dev/null && apt-get install -y $(RUN_DEPS) >/dev/null && exec ./build.linux/tvheadend -c /tmp/tvheadend -C'
+	docker run --rm -it -p 9981:9981 \
+		-v "$(CURDIR):/ws" -w /ws/$(SRC) "$(BUILDER_IMAGE)" \
+		./build.linux/tvheadend -c /tmp/tvheadend -C
 
 update:
 	@test -d $(SRC)/$(PATCHES) || { echo "No $(SRC)/$(PATCHES)/ — run 'make prepare QUILT=1' first"; exit 1; }
@@ -102,3 +143,8 @@ refresh:
 
 clean:
 	rm -rf $(SRC)
+	rm -f $(IMAGE_STAMP)
+
+clean-image:
+	-docker image rm $(BUILDER_IMAGE)
+	rm -f $(IMAGE_STAMP)
