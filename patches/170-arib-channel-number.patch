@@ -64,3 +64,38 @@
      }
    }}
  
+--- a/src/input/mpegts/mpegts_service.c
++++ b/src/input/mpegts/mpegts_service.c
+@@ -579,8 +579,30 @@ mpegts_service_channel_number ( service_
+     if (r <= 0)
+       r = ms->s_dvb_opentv_chnum * CHANNEL_SPLIT;
+   }
+-  if (r <= 0 && ms->s_dvb_mux->mm_network->mn_sid_chnum)
+-    r = service_id16(ms) * CHANNEL_SPLIT;
++  /*
++   * Japanese BS/CS (ISDB-S) broadcasts don't carry ARIB STD-B10's
++   * TS_information_descriptor (0xCD), so s_dvb_channel_num stays 0 on
++   * those services. By ARIB convention the service_id IS the on-air
++   * three-digit channel number (NHK BS1 = 101, BS-Asahi = 151, CS CNNj
++   * = 354, ...) -- the same fallback Mirakurun applies via
++   * "remoteControlKeyId || serviceId". Always honour it for ISDB-S muxes
++   * in addition to the existing user-toggled mn_sid_chnum knob.
++   */
++  if (r <= 0) {
++    int fallback = ms->s_dvb_mux->mm_network->mn_sid_chnum;
++#if ENABLE_MPEGTS_DVB
++    if (!fallback && ms->s_dvb_mux) {
++      extern const idclass_t dvb_mux_class;
++      if (idnode_is_instance(&ms->s_dvb_mux->mm_id, &dvb_mux_class)) {
++        dvb_mux_t *mmd = (dvb_mux_t*)ms->s_dvb_mux;
++        if (mmd->lm_tuning.dmc_fe_delsys == DVB_SYS_ISDBS)
++          fallback = 1;
++      }
++    }
++#endif
++    if (fallback)
++      r = service_id16(ms) * CHANNEL_SPLIT;
++  }
+   return r;
+ }
+ 
