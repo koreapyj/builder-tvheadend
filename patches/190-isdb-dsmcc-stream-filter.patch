@@ -1,0 +1,363 @@
+--- a/src/api/api_esfilter.c
++++ b/src/api/api_esfilter.c
+@@ -67,6 +67,7 @@ ESFILTER(teletext, ESF_CLASS_TELETEXT);
+ ESFILTER(subtit, ESF_CLASS_SUBTIT);
+ ESFILTER(ca, ESF_CLASS_CA);
+ ESFILTER(other, ESF_CLASS_OTHER);
++ESFILTER(dsmcc, ESF_CLASS_DSMCC);
+ 
+ void api_esfilter_init ( void )
+ {
+@@ -95,6 +96,10 @@ void api_esfilter_init ( void )
+     { "esfilter/other/grid",     ACCESS_ANONYMOUS, api_idnode_grid,  api_esfilter_grid_other },
+     { "esfilter/other/create",   ACCESS_ADMIN,     api_esfilter_create_other, NULL },
+ 
++    { "esfilter/dsmcc/class",    ACCESS_ANONYMOUS, api_idnode_class, (void*)&esfilter_class_dsmcc },
++    { "esfilter/dsmcc/grid",     ACCESS_ANONYMOUS, api_idnode_grid,  api_esfilter_grid_dsmcc },
++    { "esfilter/dsmcc/create",   ACCESS_ADMIN,     api_esfilter_create_dsmcc, NULL },
++
+     { NULL },
+   };
+ 
+--- a/src/esfilter.c
++++ b/src/esfilter.c
+@@ -36,7 +36,8 @@ uint32_t esfilterclsmask[ESF_CLASS_LAST+
+   ESF_MASK_TELETEXT,
+   ESF_MASK_SUBTIT,
+   ESF_MASK_CA,
+-  ESF_MASK_OTHER
++  ESF_MASK_OTHER,
++  ESF_MASK_DSMCC
+ };
+ 
+ static const idclass_t *esfilter_classes[ESF_CLASS_LAST+1] = {
+@@ -46,7 +47,8 @@ static const idclass_t *esfilter_classes
+   &esfilter_class_teletext,
+   &esfilter_class_subtit,
+   &esfilter_class_ca,
+-  &esfilter_class_other
++  &esfilter_class_other,
++  &esfilter_class_dsmcc
+ };
+ 
+ /*
+@@ -61,6 +63,7 @@ static struct strtab esfilterclasstab[]
+   { "SUBTIT",     ESF_CLASS_SUBTIT },
+   { "CA",         ESF_CLASS_CA },
+   { "OTHER",      ESF_CLASS_OTHER },
++  { "DSMCC",      ESF_CLASS_DSMCC },
+ };
+ 
+ const char *
+@@ -333,6 +336,7 @@ ESFILTER_CLS(teletext, ESF_CLASS_TELETEX
+ ESFILTER_CLS(subtit, ESF_CLASS_SUBTIT);
+ ESFILTER_CLS(ca, ESF_CLASS_CA);
+ ESFILTER_CLS(other, ESF_CLASS_OTHER);
++ESFILTER_CLS(dsmcc, ESF_CLASS_DSMCC);
+ 
+ static const void *
+ esfilter_class_language_get(void *o)
+@@ -1163,6 +1167,100 @@ const idclass_t esfilter_class_other = {
+       .get      = esfilter_class_action_get,
+       .set      = esfilter_class_action_set,
+       .list     = esfilter_class_action_enum,
++      .opts     = PO_DOC_NLIST,
++      .doc      = prop_doc_action,
++    },
++    {
++      .type     = PT_BOOL,
++      .id       = "log",
++      .name     = N_("Log"),
++      .desc     = N_("Write a short message to log identifying the "
++                     "matched parameters. It is useful for debugging "
++                     "your setup or structure of incoming streams."),
++      .off      = offsetof(esfilter_t, esf_log),
++    },
++    {
++      .type     = PT_STR,
++      .id       = "comment",
++      .name     = N_("Comment"),
++      .desc     = N_("Free-format text field. Enter whatever you "
++                     "like here."),
++      .off      = offsetof(esfilter_t, esf_comment),
++    },
++    {}
++  }
++};
++
++const idclass_t esfilter_class_dsmcc = {
++  .ic_super      = &esfilter_class,
++  .ic_class      = "esfilter_dsmcc",
++  .ic_caption    = N_("Stream Filters - DSM-CC"),
++  .ic_properties = (const property_t[]){
++    {
++      .type     = PT_STR,
++      .islist   = 1,
++      .id       = "type",
++      .name     = N_("Stream type"),
++      .desc     = N_("The DSM-CC data carousel stream type. These streams "
++                     "(e.g. ISDB BML data broadcasting) are ignored unless "
++                     "a rule here uses them."),
++      .get      = esfilter_class_type_get,
++      .set      = esfilter_class_type_set_dsmcc,
++      .list     = esfilter_class_type_enum_dsmcc,
++      .rend     = esfilter_class_type_rend,
++      .opts     = PO_DOC_NLIST,
++    },
++    {
++      .type     = PT_STR,
++      .id       = "language",
++      .name     = N_("Language"),
++      .desc     = N_("The language to which the filter should apply."),
++      .get      = esfilter_class_language_get,
++      .set      = esfilter_class_language_set,
++      .list     = esfilter_class_language_enum,
++      .opts     = PO_DOC_NLIST,
++    },
++    {
++      .type     = PT_STR,
++      .id       = "service",
++      .name     = N_("Service"),
++      .desc     = N_("The service the filter should apply to. "
++                     "Leave blank to apply the filter to all "
++                     "services."),
++      .get      = esfilter_class_service_get,
++      .set      = esfilter_class_service_set,
++      .list     = esfilter_class_service_enum,
++    },
++    {
++      .type     = PT_INT,
++      .id       = "pid",
++      .name     = N_("PID"),
++      .desc     = N_("Program identification (PID) number to compare. "
++                     "Zero means any. This comparison is processed "
++                     "only when service comparison is active."),
++      .off      = offsetof(esfilter_t, esf_pid),
++    },
++    {
++      .type     = PT_INT,
++      .id       = "component_tag",
++      .name     = N_("Component tag"),
++      .desc     = N_("ARIB/DVB component_tag of the data carousel to "
++                     "compare (e.g. 0x40 = 64, the BML entry-point "
++                     "carousel). Entered in decimal. Zero means any. "
++                     "Unlike the PID, the component_tag is stable across "
++                     "re-scans/remuxes and is matched on its own."),
++      .off      = offsetof(esfilter_t, esf_component_tag),
++    },
++    {
++      .type     = PT_INT,
++      .id       = "action",
++      .name     = N_("Action"),
++      .desc     = N_("The rule action defines the operation when all "
++                     "comparisons succeed. DSM-CC streams are ignored by "
++                     "default; use action 'Use' to record them."),
++      .get      = esfilter_class_action_get,
++      .set      = esfilter_class_action_set,
++      .list     = esfilter_class_action_enum,
+       .opts     = PO_DOC_NLIST,
+       .doc      = prop_doc_action,
+     },
+--- a/src/esfilter.h
++++ b/src/esfilter.h
+@@ -30,7 +30,8 @@ typedef enum {
+   ESF_CLASS_SUBTIT,
+   ESF_CLASS_CA,
+   ESF_CLASS_OTHER,
+-  ESF_CLASS_LAST = ESF_CLASS_OTHER
++  ESF_CLASS_DSMCC,
++  ESF_CLASS_LAST = ESF_CLASS_DSMCC
+ } esfilter_class_t;
+ 
+ #define ESF_CLASS_IS_VALID(i) \
+@@ -43,6 +44,7 @@ extern const idclass_t esfilter_class_te
+ extern const idclass_t esfilter_class_subtit;
+ extern const idclass_t esfilter_class_ca;
+ extern const idclass_t esfilter_class_other;
++extern const idclass_t esfilter_class_dsmcc;
+ 
+ #define ESF_MASK_VIDEO \
+   (SCT_MASK(SCT_MPEG2VIDEO) | SCT_MASK(SCT_H264) | SCT_MASK(SCT_VP8) | \
+@@ -65,6 +67,9 @@ extern const idclass_t esfilter_class_ot
+ #define ESF_MASK_OTHER \
+   (SCT_MASK(SCT_MPEGTS) | SCT_MASK(SCT_HBBTV) | SCT_MASK(SCT_RDS))
+ 
++#define ESF_MASK_DSMCC \
++  SCT_MASK(SCT_DSMCC)
++
+ extern uint32_t esfilterclsmask[];
+ 
+ TAILQ_HEAD(esfilter_entry_queue, esfilter);
+@@ -94,6 +99,7 @@ typedef struct esfilter {
+   char esf_service[UUID_HEX_SIZE];
+   int esf_sindex;
+   int esf_pid;
++  int esf_component_tag;
+   uint16_t esf_caid;
+   uint32_t esf_caprovider;
+   int esf_action;
+--- a/src/esstream.c
++++ b/src/esstream.c
+@@ -271,6 +271,10 @@ filter:
+     o = p;
+     mask = esfilterclsmask[i];
+     if (TAILQ_EMPTY(&esfilters[i])) {
++      /* DSM-CC data carousels (e.g. ISDB BML) are ignored by default; they
++       * are only recorded when an explicit 'use' rule is configured. */
++      if (i == ESF_CLASS_DSMCC)
++        continue;
+       TAILQ_FOREACH(st, &set->set_all, es_link) {
+         if ((mask & SCT_MASK(st->es_type)) != 0) {
+           elementary_set_filter_build_add(set, st, sta, &p);
+@@ -293,6 +297,9 @@ filter:
+         if (esf->esf_language[0] &&
+             strncmp(esf->esf_language, st->es_lang, 4))
+           continue;
++        if (esf->esf_component_tag &&
++            esf->esf_component_tag != st->es_component_tag)
++          continue;
+         if (esf->esf_service[0]) {
+           if (strcmp(esf->esf_service, service_ubuf))
+             continue;
+@@ -428,6 +435,10 @@ ignore:
+     }
+     if (!exclusive) {
+       TAILQ_FOREACH(st, &set->set_all, es_link) {
++        /* DSM-CC carousels are opt-in: do not auto-include streams that no
++         * rule explicitly used (only ESFM_USED ones stay in the set). */
++        if (i == ESF_CLASS_DSMCC)
++          continue;
+         if ((mask & SCT_MASK(st->es_type)) != 0 &&
+             (st->es_filter & (ESFM_USED|ESFM_IGNORE)) == 0) {
+           elementary_set_filter_build_add(set, st, sta, &p);
+@@ -471,6 +482,7 @@ create:
+ 
+   st->es_type = type;
+   st->es_cc = -1;
++  st->es_component_tag = -1;
+ 
+   TAILQ_INSERT_TAIL(&set->set_all, st, es_link);
+   st->es_service = set->set_service;
+--- a/src/esstream.h
++++ b/src/esstream.h
+@@ -67,7 +67,8 @@ enum streaming_component_type {
+   SCT_FLAC,
+   SCT_AC4,
+   SCT_ARIBSUB, /* ARIB STD-B24 caption / superimpose (ISDB) */
+-  SCT_LAST = SCT_ARIBSUB
++  SCT_DSMCC,   /* DSM-CC data carousel (ISDB BML data broadcasting) */
++  SCT_LAST = SCT_DSMCC
+ };
+ 
+ #define SCT_MASK(t) (1 << (t))
+@@ -114,6 +115,8 @@ struct elementary_info {
+   uint16_t es_composition_id;
+   uint16_t es_ancillary_id;
+ 
++  int16_t es_component_tag;  /* DVB/ARIB stream_identifier (0x52), -1 if unset */
++
+   uint16_t es_parent_pid;    /* For subtitle streams originating from
+ 				a teletext stream. this is the pid
+ 				of the teletext stream */
+--- a/src/input/mpegts/dvb_psi_pmt.c
++++ b/src/input/mpegts/dvb_psi_pmt.c
+@@ -244,6 +244,7 @@ dvb_psi_parse_pmt
+   uint32_t update = 0;
+   int composition_id;
+   int ancillary_id;
++  int component_tag;
+   int version;
+   int position;
+   int tt_position;
+@@ -311,6 +312,7 @@ dvb_psi_parse_pmt
+     hts_stream_type = SCT_UNKNOWN;
+     composition_id = -1;
+     ancillary_id = -1;
++    component_tag = -1;
+     rds_uecp = 0;
+     ac4 = 0;
+     position = 0;
+@@ -360,6 +362,10 @@ dvb_psi_parse_pmt
+       hts_stream_type = SCT_HEVC;
+       break;
+ 
++    case 0x0d:	/* ISO/IEC 13818-6 DSM-CC data carousel (e.g. ISDB BML) */
++      hts_stream_type = SCT_DSMCC;
++      break;
++
+     case 0x80:	/* DigiCipher II (North American cable) encrypted MPEG-2 */
+       hts_stream_type = SCT_MPEG2VIDEO;
+       break;
+@@ -470,14 +476,18 @@ dvb_psi_parse_pmt
+           hts_stream_type = SCT_ARIBSUB;
+         break;
+ 
+-#if ENABLE_ARIBB24
+       case DVB_DESC_STREAM_ID:
++        /* stream_identifier_descriptor: 1 byte component_tag. Stored on the
++         * elementary stream so esfilter rules can select by it. */
++        if(dlen >= 1)
++          component_tag = ptr[0];
++#if ENABLE_ARIBB24
+         /* ISDB BS/CS logo carousel: an ES tagged component_tag 0x79 (BS) or
+          * 0x7A (CS) carries the DSM-CC data carousel - open a handler. */
+         if(dlen >= 1 && (ptr[0] == 0x79 || ptr[0] == 0x7A))
+           dvb_dsmcc_install(mt->mt_mux, pid);
+-        break;
+ #endif
++        break;
+ 
+       default:
+         break;
+@@ -544,6 +554,9 @@ dvb_psi_parse_pmt
+         update |= PMT_UPDATE_ANCILLARY_ID;
+       }
+ 
++      if(component_tag != -1)
++        st->es_component_tag = component_tag;
++
+       if(st->es_rds_uecp != rds_uecp) {
+         st->es_rds_uecp = rds_uecp;
+         update |= PMT_UPDATE_RDS_UECP;
+--- a/src/streaming.c
++++ b/src/streaming.c
+@@ -591,6 +591,7 @@ static struct strtab streamtypetab[] = {
+   { "FLAC",       SCT_FLAC },
+   { "AC-4",       SCT_AC4 },
+   { "ARIBSUB",    SCT_ARIBSUB },
++  { "DSMCC",      SCT_DSMCC },
+ };
+ 
+ /**
+--- a/src/webui/static/app/esfilter.js
++++ b/src/webui/static/app/esfilter.js
+@@ -106,11 +106,28 @@ tvheadend.esfilter_tabs = function(panel
+     });
+ 
+     tvheadend.idnode_grid(panel, {
++        url: 'api/esfilter/dsmcc',
++        titleS: _('DSM-CC Stream Filter'),
++        titleP: _('DSM-CC Stream Filters'),
++        iconCls: 'otherFilters',
++        tabIndex: 6,
++        uilevel: 'expert',
++        edit: { params: { list: eslist } },
++        add: {
++            params: { list: eslist },
++            url: 'api/esfilter/dsmcc',
++            create: {}
++        },
++        del: true,
++        move: true
++    });
++
++    tvheadend.idnode_grid(panel, {
+         url: 'api/esfilter/other',
+         titleS: _('Other Stream Filter'),
+         titleP: _('Other Stream Filters'),
+         iconCls: 'otherFilters',
+-        tabIndex: 6,
++        tabIndex: 7,
+         uilevel: 'expert',
+         edit: { params: { list: eslist } },
+         add: {
