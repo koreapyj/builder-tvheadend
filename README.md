@@ -1,38 +1,6 @@
 # builder-tvheadend
 
-GitHub Actions builder that compiles [Tvheadend](https://github.com/tvheadend/tvheadend)
-into Debian `.deb` packages and publishes them as a GitHub Release.
-
-It holds no Tvheadend source — each build clones Tvheadend fresh into `src/`, applies the
-patch series in `patches/`, and builds inside a per-distro Docker container.
-
-## What it builds
-
-| Distribution        | Architectures |
-|---------------------|---------------|
-| Debian 13 (trixie)  | amd64, arm64  |
-| Ubuntu 24.04 (noble)| amd64, arm64  |
-
-Each job produces the `tvheadend` and `tvheadend-dbg` `.deb`s, built *lean* — no static
-FFmpeg; transcoding links dynamically against the target distro's FFmpeg libraries.
-
-## Triggering a build
-
-Push a tag of the form **`release-g<commit>`**. The `release-g` prefix is stripped and the
-remainder is checked out as a Tvheadend commit, then built and published as a Release:
-
-```sh
-git tag release-gf37b7b2cb
-git push origin release-gf37b7b2cb
-```
-
-Tvheadend has no current version tags (development lives on `master`), so builds are pinned
-to a commit hash. The `g<commit>` form mirrors `git describe`, so the tag matches the
-package version `…~g<commit>~<codename>`.
-
-You can also run the workflow manually (**Actions → Build Tvheadend → Run workflow**) with a
-`ref` input — any branch, tag, or commit, default `master`. Manual runs upload artifacts
-only; they do not create a Release.
+[tvheadend](https://tvheadend.org/) focused on Japanese DTV.
 
 ## Patches
 
@@ -40,92 +8,92 @@ only; they do not create a Release.
 is no `series` file — CI applies the patches with `git apply` in `ls | sort` order, so the
 numeric `NNN` prefix *is* the apply order.
 
-Included patches — the **`00x`** range is generic upstream bug fixes; **`1xx`** is the
-ARIB / ISDB feature patches; **`5xx`** is reserved for additional device / tuner support:
+Patches follow a number convention by category:
 
-- **`001-dvr-subscription-title-utf8.patch`** — fixes the web UI websocket dying once a
-  recording exists. Tvheadend builds the recording's subscription title with
-  `snprintf(buf, …, "DVR: %s", title)` into a fixed buffer; a long title (Japanese is
-  3 bytes per character) gets truncated mid-UTF-8-character, and that invalid string is
-  streamed in the comet status feed — the browser rejects the non-UTF-8 frame and closes the
-  socket. The patch trims the dangling partial character with `utf8_validate_inplace()`.
-  Not ARIB-specific — a generic Tvheadend buffer-truncation bug that long multibyte titles
-  expose.
-- **`110-aribb24-text-encoding.patch`** — adds **ARIB STD-B24** (Japanese ISDB) text
-  decoding via `libaribb24`, exposed as an `ARIB-STD-B24` option in the *Character set*
-  dropdown (network / mux / service). When selected, every SI/EPG string from that tuner is
-  decoded as ARIB STD-B24. Built in via `--enable-aribb24` (needs `libaribb24-dev`).
-- **`120-aribb24-subtitle.patch`** — recognises ARIB STD-B24 caption (subtitle) elementary
-  streams in ISDB PMTs (`stream_type 0x06` + ARIB data-component descriptor) as a new
-  `ARIBSUB` component type, so their PID is filtered, passed through into recordings / TS
-  streams, and shown in the web UI. Passthrough only — captions are carried, not rendered.
-- **`130-aribb24-epg.patch`** — teaches the OTA EIT grabber the **ARIB STD-B10** EPG
-  semantics used by ISDB. Descriptors: the content descriptor (`0x54`) genres are remapped
-  from the ARIB genre table to the nearest DVB ETSI genre; the series descriptor (`0xD5`)
-  supplies episode / total-episode numbers and a serieslink; the extended-event (`0x4E`)
-  key/value detail items — which Tvheadend otherwise discards — are folded into the program
-  description; the event group descriptor (`0xD6`) adds a short relay/shared-event note.
-  It also fixes two ways ISDB EPG entries lost their text: a `short_event` decoding to blank
-  (ASCII / U+3000 padding) no longer overwrites a real title, and a *partial* EIT pass — an
-  EIT[schedule] "basic" segment or a shared/relayed event with no `short_event` — no longer
-  makes `epg_broadcast_change_finish()` wipe the title/genre/description a fuller pass set
-  (which made entries flicker between filled and empty). The ARIB descriptor paths activate
-  only for services whose *Character set* is `ARIB-STD-B24`.
-- **`140-isdb-s-broadcast-support.patch`** — fills the ISDB-S gaps tvheadend has upstream.
-  Tvheadend ships an ISDB-S FE type, delivery-system enum, network / mux / frontend classes
-  and S2API tune commands, but four spots assume the type does not exist: the legacy
-  parameter-copy `switch` in `linuxdvb_frontend_tune()` misses `DVB_TYPE_ISDB_S` (every tune
-  returns `SM_CODE_TUNING_FAILED` with "unknown FE type 9"); the scanfile loader's
-  region-type allow-list omits `isdb-s` and `scanfile_load_dvbv5()` has no `DVB_SYS_ISDBS`
-  branch (any Japan BS/CS preset is silently dropped); the mux `display_name` only treats
-  `DVB_TYPE_S` as kHz-stored and routes ISDB-S through the Hz-storage path (so a
-  11 727 480 kHz BS mux renders as "11.727 MHz"); and `dvb_mux_conf_init()` never sets a
-  default polarisation/symbol-rate for ISDB-S, so on restart the saved mux loses its R/28.86
-  Mbaud and the WebUI shows "H" until next tune. The patch adds the missing `DVB_TYPE_ISDB_S`
-  case in each spot — including a parse branch that reads `POLARIZATION`, `SYMBOL_RATE`,
-  `STREAM_ID` and `INVERSION` so the seedfile values reach `dmc_fe_qpsk` for the linuxdvb
-  tune ioctls (`DTV_VOLTAGE` / `DTV_SYMBOL_RATE`).
-- **`150-isdb-cdt-logo.patch`** — extracts **ISDB station logos** from the CDT (Common Data
-  Table, PID `0x29`) and uses them as channel icons. ISDB broadcasts each broadcaster's logo
-  as a palettised PNG with the `PLTE`/`tRNS` chunks stripped; the patch parses the CDT,
-  rebuilds the PNG from the fixed 129-entry ARIB logo CLUT, writes it under
-  `<config>/isdb_logos/`, and sets it as the icon of every channel of the matching service
-  (matched via the SDT `logo_transmission_descriptor`, tag `0xCF`). Terrestrial logos — BS/CS
-  use a DSM-CC carousel (patch 151). A user-set channel icon is never overwritten.
-- **`151-isdb-dsmcc-logo.patch`** — extracts **BS/CS** station logos, which (unlike
-  terrestrial) ride a **DSM-CC data carousel** rather than the CDT. When a PMT advertises a
-  data ES tagged `component_tag 0x79`/`0x7A` (the ARIB TR-B15 logo carousel), tvheadend opens
-  a DSM-CC handler on it: a DII (`table_id 0x3B`) announces the `LOGO-05`/`CS_LOGO-05` module,
-  DDB sections (`0x3C`) carry it block-by-block, and the reassembled module's per-service
-  logos are reconstructed and applied exactly as for the CDT (patch 150). Implemented to the
-  ARIB TR-B15 spec — it needs a transport that actually carries the carousel (a real ISDB-S
-  tuner, or a full-transponder stream); service-filtered IPTV streams strip it.
-- **`170-arib-channel-number.patch`** — populates ISDB channel numbers. The standard DVB
-  logical-channel-number descriptors (0x83 etc.) are not used by ISDB; instead ARIB STD-B10
-  carries the channel number ("リモコン番号") in the **TS Information descriptor** (tag
-  `0xCD`) inside NIT, as a per-TS `remote_control_key_id` plus a list of `service_id`s. The
-  patch parses that descriptor in the NIT TS-loop, walking the per-transmission-type service
-  lists and assigning each service's `s_dvb_channel_num` from `remote_control_key_id` and
-  `s_dvb_channel_minor` from the low 3 bits of `service_id` (the per-broadcaster service
-  offset, per ARIB TR-B14), giving the familiar Japanese "X.Y" channel display (e.g. 4.1 for
-  NTV primary, 4.2 for the sub-service). Without this, every ISDB service scanned by
-  tvheadend shows channel number 0.0.
-- **`180-aribb25-descrambler.patch`** — adds ARIB STD-B25 (MULTI2) descrambling as a new
-  tvheadend CA client backed by [libaribb25](https://github.com/koreapyj/libaribb25). Unlike
-  tvheadend's other CA clients (CWC / CCcam / capmt) which supply control words to
-  tvhcsa, libaribb25 owns the whole pipeline — it parses PMT/ECM, talks to a B-CAS card,
-  and emits descrambled TS — so the client attaches itself per-mux as a new
-  `mm_filter_packets` hook run early in `mpegts_input_recv_packets`. The B-CAS card
-  backend is a user option: **CobaltCas** (a software Blue Card emulator, linked in by
-  building libaribb25 with `-DUSE_COBALTCAS=ON`) or **PC/SC** (a physical card via
-  `libpcsclite`). `process_emm` is exposed as a separate option — leave off for
-  CobaltCas (Blue Card has no entitlements to update), turn on for a physical Red Card
-  so pay-channel entitlements keep refreshing. CobaltCas card-image path is
-  configurable. Activates automatically on services with CAID `0x0005`. libaribb25 is
-  built and installed by the CI / `make build` workflow via `support/build-libaribb25.sh`
-  (the libaribb25 fork's stock cobalt cpp is a Linux-buildable but missing user-facing
-  setters for the card image path / log; the script injects three small `extern "C"`
-  setters before cmake-installing the static `libaribb25.a`).
+- **`00x`** — generic upstream bug fixes (useful for every Tvheadend user, ARIB or not)
+- **`1xx`** — ARIB / ISDB feature patches (Japanese broadcast support)
+- **`2xx`** — additional device / tuner support
+
+### Generic upstream bug fixes (`00x`)
+
+- **`001-dvr-subscription-title-utf8.patch`** — Stops the Tvheadend web UI from freezing
+  the moment a recording is in progress. Long recording titles containing CJK or other multibyte characters cause the live status feed to send a
+  malformed UTF-8 frame; this patch keeps the frame valid so the UI keeps updating.
+
+- **`002-eit-section-completion.patch`** — Makes the EPG grabber download the **full
+  schedule** broadcasters transmit (often 7–8 days) instead of giving up after 60–120
+  seconds with only 1–3 days. The grabber now waits until every EPG section the
+  broadcaster says exists has actually arrived before releasing the tuner. Saves you
+  from blank dates several days out in the programme guide.
+
+### ARIB / ISDB feature patches (`1xx`)
+
+These activate when you set the **Character set** of a Japanese network / mux / service
+to `ARIB-STD-B24`. Otherwise they are inert and don't affect non-ARIB users.
+
+- **`110-aribb24-text-encoding.patch`** — Adds **`ARIB-STD-B24`** to the *Character set*
+  dropdown. Set it on your Japanese network and channel names, programme titles and
+  descriptions display correctly in Japanese instead of as garbled bytes. Requires
+  `libaribb24` (installed automatically by the build).
+
+- **`120-aribb24-subtitle.patch`** — Recognises Japanese closed-caption (字幕) streams
+  so they're carried through into recordings and live streams. Captions are passed
+  through, not rendered — pick them up in your downstream player.
+
+- **`130-aribb24-epg.patch`** — Makes the **programme guide** for Japanese channels look
+  right. Genre, episode numbers, the extended description fields (cast, director, etc.),
+  and programme-relay / shared-event notes — all of which vanilla Tvheadend throws away —
+  now show up. Also stops EPG entries from flickering between filled and blank as
+  successive EPG passes arrive.
+
+- **`140-isdb-s-broadcast-support.patch`** — Makes Japanese **BS / 110°E CS satellite**
+  actually tunable. Without this, every ISDB-S tune attempt fails with "tuning failed",
+  imported BS/CS scanfiles silently don't load, and mux frequencies display incorrectly
+  in the UI. Required for any BS/CS reception.
+
+- **`150-isdb-cdt-logo.patch`** — Automatically fetches Japanese **terrestrial (地デジ)**
+  channel logos that the broadcaster transmits in the signal and applies them as channel
+  icons. Logos appear after the channel has been tuned for a short while. A logo you've
+  set manually is never overwritten.
+
+- **`151-isdb-dsmcc-logo.patch`** — Same as 150 but for **BS / CS satellite** channels,
+  which transmit their logos via a different mechanism. Needs a real tuner — IPTV streams
+  strip the logo data out.
+
+- **`152-isdb-logo-id-zero.patch`** — Fixes **NHK 総合** (NHK General) terrestrial
+  channels failing to pick up their logo even after waiting all day. NHK's logo
+  identifier happens to be `0`, which the earlier logo patches mistakenly treated as
+  "no logo". With this fix NHK G's logo applies the moment a fresh SDT comes through.
+
+- **`160-jp-isdb-scanfiles.patch`** — Bundles ready-to-import scanfiles for **Japan**
+  ISDB-T (terrestrial UHF channels 13–62) and ISDB-S (BS / 110°E CS, all 12 TLV slots).
+  Pick `isdb-t/jp-Japan` or `isdb-s/jp-Japan` from Tvheadend's scan-network dropdown
+  instead of typing muxes by hand.
+
+- **`170-arib-channel-number.patch`** — Gives Japanese channels their familiar **X.Y
+  channel numbers** (e.g. `4.1` for NTV's main service, `4.2` for the sub-channel).
+  Without this, every ISDB channel in Tvheadend shows up as channel `0.0`.
+
+- **`180-aribb25-descrambler.patch`** — **Decrypts encrypted Japanese broadcasts**
+  (B-CAS / MULTI2). Two card backends to pick from:
+  - **[CobaltCas](https://github.com/CobaltCas/CobaltCas)** — software Blue Card emulator. Works out of the box, no physical card
+    needed; ideal for unencrypted-Blue-Card-tier content.
+  - **PC/SC** — a real B-CAS card (typically a Red Card) plugged into a PC/SC reader,
+    for pay-channel entitlements.
+
+  Configured under *Configuration → CAs* per descrambler instance; activates automatically
+  on any service that needs it.
+
+### Device / tuner support (`2xx`)
+
+- **`200-pt1-device-support.patch`** — Adds tuner support for **Earthsoft PT1 / PT3**
+  PCI cards and the **PLEX / Digibest USB tuners** commonly used in Japan: PX5,
+  PX-MLT5PE, PX-MLT8PE, Digibest ISDB6014, plus the Asicen ASV5220. Works through the
+  [nns779/px4_drv](https://github.com/nns779/px4_drv) Linux kernel driver (build separately
+  per the driver's instructions). Each tuner appears as a configurable adapter in the
+  WebUI under *Configuration → DVB Inputs → TV adapters*.
+
+  If you wish to use hardware PID filter, use modified driver [koreapyj/px4_drv](https://github.com/koreapyj/px4_drv).
 
 ## Local patch development
 
@@ -155,8 +123,6 @@ the runnable binary `src/build.linux/tvheadend`. `make run` launches it with the
 <http://localhost:9981>. Object files persist under `src/build.linux/`, so repeat builds are
 incremental.
 
-## Notes
+## Special Thanks
 
-- arm64 build jobs use GitHub's `ubuntu-24.04-arm` runners — free for public repositories;
-  a private repository needs a paid plan for arm64 runners.
-- `src/`, `dist/` and `*.deb` are git-ignored build scratch / output.
+This project is highly inspired by Mirakurun project.
