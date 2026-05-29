@@ -10,7 +10,7 @@ Index: src/src/epggrab/module/eit.c
    int        tableid;
    int        sect;
    int        local_time;
-@@ -110,6 +111,16 @@ static TAILQ_HEAD(, eit_private) eit_pri
+@@ -255,6 +256,16 @@ eit_section_state_free(epggrab_ota_map_t
   * Status handling
   * ***********************************************************************/
  
@@ -27,7 +27,7 @@ Index: src/src/epggrab/module/eit.c
  typedef struct eit_event
  {
    char              uri[529];
-@@ -141,6 +152,10 @@ typedef struct eit_event
+@@ -286,6 +297,10 @@ typedef struct eit_event
    time_t            first_aired;
    uint16_t          copyright_year;
  
@@ -38,7 +38,7 @@ Index: src/src/epggrab/module/eit.c
  } eit_event_t;
  
  
-@@ -184,6 +199,41 @@ static dvb_string_conv_t _eit_freesat_co
+@@ -329,6 +344,41 @@ static dvb_string_conv_t _eit_freesat_co
    { 0x00, NULL }
  };
  
@@ -80,7 +80,7 @@ Index: src/src/epggrab/module/eit.c
  /*
   * Get string
   */
-@@ -202,6 +252,24 @@ static int _eit_get_string_with_len
+@@ -347,6 +397,24 @@ static int _eit_get_string_with_len
    return dvb_get_string_with_len(dst, dstlen, src, srclen, charset, cptr);
  }
  
@@ -105,7 +105,7 @@ Index: src/src/epggrab/module/eit.c
  /*
   * Short Event - 0x4d
   */
-@@ -224,7 +292,11 @@ static int _eit_desc_short_event
+@@ -369,7 +437,11 @@ static int _eit_desc_short_event
    if ( (r = _eit_get_string_with_len(mod, buf, sizeof(buf),
                                       ptr, len, ev->default_charset)) < 0 ) {
      return -1;
@@ -118,7 +118,7 @@ Index: src/src/epggrab/module/eit.c
      if (!ev->title) ev->title = lang_str_create();
      lang_str_add(ev->title, buf, lang);
    }
-@@ -237,7 +309,8 @@ static int _eit_desc_short_event
+@@ -382,7 +454,8 @@ static int _eit_desc_short_event
    if ( (r = _eit_get_string_with_len(mod, buf, sizeof(buf),
                                       ptr, len, ev->default_charset)) < 0 ) {
      return -1;
@@ -128,7 +128,7 @@ Index: src/src/epggrab/module/eit.c
      if (!ev->summary) ev->summary = lang_str_create();
      lang_str_add(ev->summary, buf, lang);
    }
-@@ -298,6 +371,21 @@ static int _eit_desc_ext_event
+@@ -443,6 +516,21 @@ static int _eit_desc_ext_event
      ilen -= r;
      iptr += r;
  
@@ -150,7 +150,7 @@ Index: src/src/epggrab/module/eit.c
      /* Store */
      // TODO: extend existing?
  #if TODO_ADD_EXTRA
-@@ -395,6 +483,22 @@ static int _eit_desc_content
+@@ -540,6 +628,22 @@ static int _eit_desc_content
  {
    uint8_t tempPtr = 0;  //Temporary variable to hold a (potentially) changed *ptr value.
    tempPtr = *ptr;
@@ -173,7 +173,7 @@ Index: src/src/epggrab/module/eit.c
    while (len > 1) {
      //If the genre translation table has been loaded, it will not be a null pointer.
      if (epggrab_ota_genre_translation){
-@@ -552,6 +656,184 @@ static int _eit_desc_crid
+@@ -697,6 +801,184 @@ static int _eit_desc_crid
    return 0;
  }
  
@@ -358,7 +358,7 @@ Index: src/src/epggrab/module/eit.c
  /*
   *
   */
-@@ -963,7 +1245,16 @@ static int _eit_process_event_one
+@@ -1108,7 +1390,16 @@ static int _eit_process_event_one
    if (ev->copyright_year > 0)
      *save |= epg_broadcast_set_copyright_year(ebc, ev->copyright_year, &changes);
  
@@ -376,7 +376,7 @@ Index: src/src/epggrab/module/eit.c
  
  
  running:
-@@ -1051,6 +1342,14 @@ static int _eit_process_event
+@@ -1196,6 +1487,14 @@ static int _eit_process_event
        case DVB_DESC_CRID:
          r = _eit_desc_crid(mod, ptr, dlen, &ev, ed);
          break;
@@ -391,7 +391,7 @@ Index: src/src/epggrab/module/eit.c
        default:
          r = 0;
          _eit_dtag_dump(mod, dtag, dlen, ptr);
-@@ -1083,6 +1382,10 @@ static int _eit_process_event
+@@ -1228,6 +1527,10 @@ static int _eit_process_event
    if (lock)
      tvh_mutex_lock(&global_lock);
    svc = (mpegts_service_t *)service_find_by_uuid0(&ed->svc_uuid);
@@ -402,7 +402,84 @@ Index: src/src/epggrab/module/eit.c
    if (svc && eit_mod->opaque) {
      LIST_FOREACH(ilm, &svc->s_channels, ilm_in1_link) {
        ch = (channel_t *)ilm->ilm_in2;
-@@ -1304,6 +1607,7 @@ svc_ok:
+@@ -1360,29 +1663,21 @@ _eit_callback
+       (hacks & EIT_HACK_INTEREST4E) != 0 /* uk_freesat hack */)
+     ota = epggrab_ota_register((epggrab_module_ota_t*)mod, NULL, mm);
+ 
+-  /* Begin */
+-  r = dvb_table_begin((mpegts_psi_table_t *)mt, ptr, len,
+-                      tableid, extraid, 11, &st, &sect, &last, &ver, 0);
+-  if (r == 0) goto complete;
+-  if (r < 0) return r;
+-  if (tableid != 0x4e && r != 1) return r;
+-  if (st && r > 0) {
+-    uint32_t mask;
+-    int sa = seg & 0xF8;
+-    int sb = 7 - (seg & 0x07);
+-    mask = (~(0xFF << sb) & 0xFF);
+-    mask <<= (24 - (sa % 32));
+-    st->sections[sa/32] &= ~mask;
+-  }
+-
+-  /* Update the EN 300 468 section bitmap for completion tracking. */
+-  if (r > 0 && tableid >= 0x50 && tableid < 0x60) {
++  /* Update the EN 300 468 section bitmap for completion tracking.
++   * Done BEFORE dvb_table_begin because that helper may early-return
++   * r==0 (already-complete per the legacy generic bitmap) which would
++   * skip the update and prevent our bitmap from ever converging.
++   * We parse the fixed fields directly from ptr. */
++  if (tableid >= 0x50 && tableid < 0x60 && (ptr[2] & 1) /* current */) {
++    int section_number              = ptr[3];
++    int last_section_number         = ptr[4];
++    int version_number              = (ptr[2] >> 1) & 0x1F;
+     int segment_last_section_number = ptr[9];
+     int last_table_id               = ptr[10];
+-    int segment      = sect >> 3;
+-    int sub          = sect & 0x07;
++    int segment      = section_number >> 3;
++    int sub          = section_number & 0x07;
+     int seg_last_sub = segment_last_section_number & 0x07;
+-    int last_segment = last >> 3;
++    int last_segment = last_section_number >> 3;
+     int range        = (tableid & 0x08) ? 1 : 0;
+     int tid_off      = tableid & 0x07;
+     eit_section_state_t *est = eit_section_state_get(map);
+@@ -1390,10 +1685,10 @@ _eit_callback
+     eit_section_flag_t  *F = range ? &ssvc->extended[tid_off]
+                                    : &ssvc->basic[tid_off];
+     int i, s;
+-    if (F->version != ver) {
++    if (F->version != version_number) {
+       memset(F->flag, 0, sizeof(F->flag));
+       memset(F->ignore, 0, sizeof(F->ignore));
+-      F->version = ver;
++      F->version = version_number;
+     }
+     F->flag[segment] |= 1u << sub;
+     for (i = seg_last_sub + 1; i < 8; i++)
+@@ -1403,6 +1698,21 @@ _eit_callback
+     eit_section_mark_tids_above(ssvc, last_table_id);
+   }
+ 
++  /* Begin */
++  r = dvb_table_begin((mpegts_psi_table_t *)mt, ptr, len,
++                      tableid, extraid, 11, &st, &sect, &last, &ver, 0);
++  if (r == 0) goto complete;
++  if (r < 0) return r;
++  if (tableid != 0x4e && r != 1) return r;
++  if (st && r > 0) {
++    uint32_t mask;
++    int sa = seg & 0xF8;
++    int sb = 7 - (seg & 0x07);
++    mask = (~(0xFF << sb) & 0xFF);
++    mask <<= (24 - (sa % 32));
++    st->sections[sa/32] &= ~mask;
++  }
++
+   /* UK Cable Virgin: EPG data for services in other transponders is transmitted
+   // in the 'actual' transpoder table IDs */
+   if ((hacks & EIT_HACK_EXTRAMUXLOOKUP) != 0 && (tableid == 0x50 || tableid == 0x4E)) {
+@@ -1477,6 +1787,7 @@ svc_ok:
      data->sect = sect;
      data->svc_uuid = svc->s_id.in_uuid;
      data->onid = onid;

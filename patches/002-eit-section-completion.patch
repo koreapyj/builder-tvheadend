@@ -1,0 +1,229 @@
+Index: src/src/epggrab/module/eit.c
+===================================================================
+--- src.orig/src/epggrab/module/eit.c
++++ src/src/epggrab/module/eit.c
+@@ -107,6 +107,151 @@ typedef struct eit_module_t
+ static TAILQ_HEAD(, eit_private) eit_private_list;
+ 
+ /* ************************************************************************
++ * EIT section bitmap (per-mux completion tracking)
++ *
++ * Tracks "have we received every EIT-schedule section the broadcaster
++ * advertised" using two EN 300 468 fields the generic dvb_psi_lib
++ * bitmap ignores:
++ *
++ *   segment_last_section_number (byte 9 of EIT payload) — within the
++ *     current 3-hour segment, the highest section number that
++ *     exists. Higher sub-sections in the same segment will never be
++ *     transmitted.
++ *   last_table_id (byte 10) — last sub-table that exists in the
++ *     range. Sub-tables in (current+1 .. last_table_id] are still
++ *     expected, the rest (up to 0x5F) will never appear.
++ *
++ * Per (onid, tsid, sid) we keep two parallel trackers — basic
++ * (table_ids 0x50..0x57) and extended (0x58..0x5F). Each range has
++ * 8 (flag, ignore) byte arrays, one per table_id. Each array is 32
++ * bytes (= 32 segments x 8 sub-sections), matching the 256-section
++ * structure of one EIT sub-table.
++ *
++ * On every received section we mark the bit in flag[] and use
++ * segment_last_section_number / last_section_number / last_table_id
++ * to populate ignore[]. Completion = every byte satisfies
++ * (flag[i] | ignore[i]) == 0xFF across every tracker.
++ *
++ * State is hung off the per-mux ota map's om_opaque and freed by
++ * the new _eit_stop callback when the grab ends.
++ * ***********************************************************************/
++
++#define EIT_SECTION_TID_RANGE_SZ  8   /* 8 tids per range (basic/extended) */
++#define EIT_SECTION_SEGMENT_BYTES 32  /* 32 segments per sub-table */
++
++typedef struct eit_section_flag {
++  uint8_t flag[EIT_SECTION_SEGMENT_BYTES];
++  uint8_t ignore[EIT_SECTION_SEGMENT_BYTES];
++  int     version;
++} eit_section_flag_t;
++
++typedef struct eit_section_svc {
++  uint16_t onid;
++  uint16_t tsid;
++  uint16_t sid;
++  eit_section_flag_t basic[EIT_SECTION_TID_RANGE_SZ];     /* 0x50..0x57 */
++  eit_section_flag_t extended[EIT_SECTION_TID_RANGE_SZ];  /* 0x58..0x5F */
++  RB_ENTRY(eit_section_svc) link;
++} eit_section_svc_t;
++
++typedef struct eit_section_state {
++  RB_HEAD(eit_section_svc_tree, eit_section_svc) svcs;
++  uint8_t ota_completed;
++} eit_section_state_t;
++
++static int
++eit_section_svc_cmp(eit_section_svc_t *a, eit_section_svc_t *b)
++{
++  if (a->onid != b->onid) return (int)a->onid - (int)b->onid;
++  if (a->tsid != b->tsid) return (int)a->tsid - (int)b->tsid;
++  return (int)a->sid - (int)b->sid;
++}
++
++static eit_section_state_t *
++eit_section_state_get(epggrab_ota_map_t *map)
++{
++  eit_section_state_t *est = map->om_opaque;
++  if (est == NULL) {
++    est = calloc(1, sizeof(*est));
++    map->om_opaque = est;
++  }
++  return est;
++}
++
++static eit_section_svc_t *
++eit_section_svc_find_or_add(eit_section_state_t *est,
++                            uint16_t onid, uint16_t tsid, uint16_t sid)
++{
++  eit_section_svc_t key, *svc;
++  int i;
++  key.onid = onid; key.tsid = tsid; key.sid = sid;
++  svc = RB_FIND(&est->svcs, &key, link, eit_section_svc_cmp);
++  if (svc) return svc;
++  svc = calloc(1, sizeof(*svc));
++  svc->onid = onid; svc->tsid = tsid; svc->sid = sid;
++  for (i = 0; i < EIT_SECTION_TID_RANGE_SZ; i++) {
++    svc->basic[i].version    = -1;
++    svc->extended[i].version = -1;
++  }
++  RB_INSERT_SORTED(&est->svcs, svc, link, eit_section_svc_cmp);
++  return svc;
++}
++
++/* Mark every table_id strictly above last_table_id (within our two
++ * ranges) as fully ignored — broadcaster declared they don't exist. */
++static void
++eit_section_mark_tids_above(eit_section_svc_t *svc, int last_table_id)
++{
++  int i;
++  for (i = 0; i < EIT_SECTION_TID_RANGE_SZ; i++) {
++    int basic_tid    = 0x50 + i;
++    int extended_tid = 0x58 + i;
++    if (basic_tid > last_table_id)
++      memset(svc->basic[i].ignore, 0xFF, sizeof(svc->basic[i].ignore));
++    if (extended_tid > last_table_id)
++      memset(svc->extended[i].ignore, 0xFF, sizeof(svc->extended[i].ignore));
++  }
++}
++
++static int
++eit_section_flag_complete(const eit_section_flag_t *F)
++{
++  int i;
++  for (i = 0; i < EIT_SECTION_SEGMENT_BYTES; i++)
++    if ((F->flag[i] | F->ignore[i]) != 0xFF) return 0;
++  return 1;
++}
++
++static int
++eit_section_is_complete(eit_section_state_t *est)
++{
++  eit_section_svc_t *svc;
++  int i;
++  if (RB_FIRST(&est->svcs) == NULL) return 0;
++  RB_FOREACH(svc, &est->svcs, link) {
++    for (i = 0; i < EIT_SECTION_TID_RANGE_SZ; i++) {
++      if (!eit_section_flag_complete(&svc->basic[i]))    return 0;
++      if (!eit_section_flag_complete(&svc->extended[i])) return 0;
++    }
++  }
++  return 1;
++}
++
++static void
++eit_section_state_free(epggrab_ota_map_t *map)
++{
++  eit_section_state_t *est = map->om_opaque;
++  eit_section_svc_t *svc;
++  if (est == NULL) return;
++  while ((svc = RB_FIRST(&est->svcs)) != NULL) {
++    RB_REMOVE(&est->svcs, svc, link);
++    free(svc);
++  }
++  free(est);
++  map->om_opaque = NULL;
++}
++
++/* ************************************************************************
+  * Status handling
+  * ***********************************************************************/
+ 
+@@ -1230,6 +1375,34 @@ _eit_callback
+     st->sections[sa/32] &= ~mask;
+   }
+ 
++  /* Update the EN 300 468 section bitmap for completion tracking. */
++  if (r > 0 && tableid >= 0x50 && tableid < 0x60) {
++    int segment_last_section_number = ptr[9];
++    int last_table_id               = ptr[10];
++    int segment      = sect >> 3;
++    int sub          = sect & 0x07;
++    int seg_last_sub = segment_last_section_number & 0x07;
++    int last_segment = last >> 3;
++    int range        = (tableid & 0x08) ? 1 : 0;
++    int tid_off      = tableid & 0x07;
++    eit_section_state_t *est = eit_section_state_get(map);
++    eit_section_svc_t   *ssvc = eit_section_svc_find_or_add(est, onid, tsid, sid);
++    eit_section_flag_t  *F = range ? &ssvc->extended[tid_off]
++                                   : &ssvc->basic[tid_off];
++    int i, s;
++    if (F->version != ver) {
++      memset(F->flag, 0, sizeof(F->flag));
++      memset(F->ignore, 0, sizeof(F->ignore));
++      F->version = ver;
++    }
++    F->flag[segment] |= 1u << sub;
++    for (i = seg_last_sub + 1; i < 8; i++)
++      F->ignore[segment] |= 1u << i;
++    for (s = last_segment + 1; s < EIT_SECTION_SEGMENT_BYTES; s++)
++      F->ignore[s] = 0xFF;
++    eit_section_mark_tids_above(ssvc, last_table_id);
++  }
++
+   /* UK Cable Virgin: EPG data for services in other transponders is transmitted
+   // in the 'actual' transpoder table IDs */
+   if ((hacks & EIT_HACK_EXTRAMUXLOOKUP) != 0 && (tableid == 0x50 || tableid == 0x4E)) {
+@@ -1329,8 +1502,13 @@ svc_ok:
+ done:
+   r = dvb_table_end((mpegts_psi_table_t *)mt, st, sect);
+ complete:
+-  if (ota && !r && (tableid >= 0x50 && tableid < 0x60))
+-    epggrab_ota_complete((epggrab_module_ota_t*)mod, ota);
++  if (ota && (tableid >= 0x50 && tableid < 0x60)) {
++    eit_section_state_t *est = map->om_opaque;
++    if (est && !est->ota_completed && eit_section_is_complete(est)) {
++      est->ota_completed = 1;
++      epggrab_ota_complete((epggrab_module_ota_t*)mod, ota);
++    }
++  }
+ 
+   return r;
+ }
+@@ -1345,6 +1523,13 @@ static int _eit_start
+   return 0;
+ }
+ 
++static int _eit_stop
++  ( epggrab_ota_map_t *map, mpegts_mux_t *dm )
++{
++  eit_section_state_free(map);
++  return 0;
++}
++
+ static void _eit_install_one_handler
+   ( mpegts_mux_t *dm, epggrab_ota_map_t *map )
+ {
+@@ -1803,6 +1988,7 @@ static void eit_init_one ( const char *i
+   ops = calloc(1, sizeof(*ops));
+   priv = calloc(1, sizeof(*priv));
+   ops->start = _eit_start;
++  ops->stop = _eit_stop;
+   ops->handlers = _eit_install_handlers;
+   ops->done = _eit_done;
+   ops->activate = _eit_activate;
