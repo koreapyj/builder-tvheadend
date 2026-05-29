@@ -1,0 +1,88 @@
+Index: src/src/input/mpegts.h
+===================================================================
+--- src.orig/src/input/mpegts.h
++++ src/src/input/mpegts.h
+@@ -579,6 +579,10 @@ struct mpegts_service
+   char    *s_dvb_cridauth;
+   uint16_t s_dvb_servicetype;
+   uint16_t s_dvb_logo_id;
++  uint8_t  s_dvb_logo_id_known; /* set when SDT carried a type 0x01/0x02
++                                   logo_transmission_descriptor — needed
++                                   because logo_id == 0 is a valid id
++                                   (used by NHK 総合 on terrestrial). */
+   int      s_dvb_ignore_eit;
+   int      s_dvb_subtitle_processing;       //Various options for replacing/augmenting the desc from the sub-title
+   int      s_dvb_ignore_matching_subtitle;  //Ignore the sub-title if same as title
+Index: src/src/input/mpegts/dvb_psi.c
+===================================================================
+--- src.orig/src/input/mpegts/dvb_psi.c
++++ src/src/input/mpegts/dvb_psi.c
+@@ -1720,7 +1720,7 @@ isdb_logo_apply ( mpegts_service_t *s )
+   idnode_list_mapping_t *ilm;
+   channel_t *ch;
+ 
+-  if (s == NULL || s->s_dvb_logo_id == 0 || s->s_dvb_mux == NULL)
++  if (s == NULL || !s->s_dvb_logo_id_known || s->s_dvb_mux == NULL)
+     return;
+   if (isdb_logo_filename(path, sizeof(path),
+                          s->s_dvb_mux->mm_onid, s->s_dvb_logo_id))
+@@ -1748,7 +1748,7 @@ isdb_logo_apply_network ( mpegts_mux_t *
+     if (m->mm_onid != onid)
+       continue;
+     LIST_FOREACH(s, &m->mm_services, s_dvb_mux_link)
+-      if (s->s_dvb_logo_id == logo_id)
++      if (s->s_dvb_logo_id_known && s->s_dvb_logo_id == logo_id)
+         isdb_logo_apply(s);
+   }
+ }
+@@ -1882,8 +1882,9 @@ isdb_dsmcc_decode_module ( mpegts_table_
+           continue;
+         s = mpegts_service_find(m, sid, 0, 0, NULL);
+         if (s) {
+-          if (s->s_dvb_logo_id != logo_id) {
++          if (s->s_dvb_logo_id != logo_id || !s->s_dvb_logo_id_known) {
+             s->s_dvb_logo_id = logo_id;
++            s->s_dvb_logo_id_known = 1;
+             idnode_changed(&s->s_id);
+           }
+           isdb_logo_apply(s);
+@@ -2076,7 +2077,7 @@ dvb_sdt_mux
+     int      free_ca_mode              = (ptr[3] >> 4) & 0x1;
+     int      stype = 0;
+ #if ENABLE_ARIBB24
+-    int      logo_id = 0;
++    int      logo_id = 0, logo_id_set = 0;
+ #endif
+     char     sprov[256], sname[256], sauth[256];
+     int      running_status            = (ptr[3] >> 5) & 0x7;
+@@ -2122,9 +2123,12 @@ dvb_sdt_mux
+           break;
+ #if ENABLE_ARIBB24
+         case DVB_DESC_LOGO_TRANSMISSION:
+-          /* ISDB logo link: type 1/2 carry a 9-bit logo_id */
+-          if (dlen >= 3 && (dptr[0] == 0x01 || dptr[0] == 0x02))
++          /* ISDB logo link: type 1/2 carry a 9-bit logo_id (0..511);
++           * logo_id == 0 is valid (NHK 総合 uses it). */
++          if (dlen >= 3 && (dptr[0] == 0x01 || dptr[0] == 0x02)) {
+             logo_id = ((dptr[1] & 0x01) << 8) | dptr[2];
++            logo_id_set = 1;
++          }
+           break;
+ #endif
+       }
+@@ -2149,11 +2153,13 @@ dvb_sdt_mux
+ 
+ #if ENABLE_ARIBB24
+     /* ISDB logo (logo_transmission_descriptor, tag 0xCF) */
+-    if (logo_id && s->s_dvb_logo_id != logo_id) {
++    if (logo_id_set &&
++        (s->s_dvb_logo_id != logo_id || !s->s_dvb_logo_id_known)) {
+       s->s_dvb_logo_id = logo_id;
++      s->s_dvb_logo_id_known = 1;
+       save = 1;
+     }
+-    if (s->s_dvb_logo_id)
++    if (s->s_dvb_logo_id_known)
+       isdb_logo_apply(s);
+ #endif
+ 
