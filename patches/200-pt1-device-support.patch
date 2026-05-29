@@ -126,7 +126,7 @@ Index: src/src/input/mpegts/pt1/pt1.c
 ===================================================================
 --- /dev/null
 +++ src/src/input/mpegts/pt1/pt1.c
-@@ -0,0 +1,1345 @@
+@@ -0,0 +1,1395 @@
 +/* pthread_timedjoin_np is a glibc extension; must be requested before
 + * any system header drags pthread.h in. */
 +#define _GNU_SOURCE
@@ -1115,6 +1115,33 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +}
 +
 +
++/* Max weight currently held on the sibling frontend. Counts both
++ * service-level subscriptions and raw mux subscriptions (mm_raw_subs,
++ * where EIT lives) — the framework's mpegts_input_get_weight only
++ * counts service subs and would report 0 for an EIT-only sibling. */
++static int
++pt1_sibling_max_weight ( pt1_frontend_t *busy_fe )
++{
++  mpegts_input_t *mi = (mpegts_input_t *)busy_fe;
++  mpegts_mux_instance_t *mmi;
++  mpegts_mux_t *mm;
++  th_subscription_t *ths;
++  service_t *s;
++  int w = 0;
++
++  tvh_mutex_lock(&mi->mi_output_lock);
++  LIST_FOREACH(mmi, &mi->mi_mux_active, mmi_active_link) {
++    mm = mmi->mmi_mux;
++    LIST_FOREACH(s, &mm->mm_transports, s_active_link)
++      LIST_FOREACH(ths, &s->s_subscriptions, ths_service_link)
++        if (ths->ths_weight > w) w = ths->ths_weight;
++    LIST_FOREACH(ths, &mm->mm_raw_subs, ths_mux_link)
++      if (ths->ths_weight > w) w = ths->ths_weight;
++  }
++  tvh_mutex_unlock(&mi->mi_output_lock);
++  return w;
++}
++
 +static int
 +pt1_frontend_is_enabled
 +  ( mpegts_input_t *mi, mpegts_mux_t *mm, int flags, int weight )
@@ -1132,13 +1159,36 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +    return MI_IS_ENABLED_RETRY;
 +
 +  /* Unified chardevs (PX5, PXMLT, ISDB6014) host two frontends sharing
-+   * one fd; if the sibling already holds the chardev, defer this one. */
++   * one fd; if the sibling already holds the chardev, weight-gated
++   * preemption: if the incoming request outranks what the sibling is
++   * doing, synchronously stop the sibling's mux so the chardev frees
++   * up. linuxdvb does the weight gate; the active eviction is
++   * pt1-specific because the framework's same-input mm_stop can't
++   * reach the sibling (it's a different mpegts_input_t). */
 +  if (la) {
++    pt1_frontend_t *busy_fe;
 +    int busy;
 +    tvh_mutex_lock(&la->pt_busy_lock);
-+    busy = (la->pt_busy_fe != NULL && la->pt_busy_fe != lfe);
++    busy_fe = la->pt_busy_fe;
++    busy = (busy_fe != NULL && busy_fe != lfe);
 +    tvh_mutex_unlock(&la->pt_busy_lock);
-+    if (busy) return MI_IS_ENABLED_RETRY;
++
++    if (busy) {
++      int busy_weight = pt1_sibling_max_weight(busy_fe);
++      if (weight > busy_weight) {
++        mpegts_input_t *busy_mi = (mpegts_input_t *)busy_fe;
++        mpegts_mux_instance_t *busy_mmi = LIST_FIRST(&busy_mi->mi_mux_active);
++        tvhinfo(LS_PT1, "%s - preempting sibling (weight %d > %d)",
++                busy_fe->mi_name, weight, busy_weight);
++        if (busy_mmi)
++          busy_mmi->mmi_mux->mm_stop(busy_mmi->mmi_mux, 1,
++                                     SM_CODE_SUBSCRIPTION_OVERRIDDEN);
++        tvh_mutex_lock(&la->pt_busy_lock);
++        busy = (la->pt_busy_fe != NULL && la->pt_busy_fe != lfe);
++        tvh_mutex_unlock(&la->pt_busy_lock);
++      }
++      if (busy) return MI_IS_ENABLED_RETRY;
++    }
 +  }
 +
 +  return MI_IS_ENABLED_OK;
