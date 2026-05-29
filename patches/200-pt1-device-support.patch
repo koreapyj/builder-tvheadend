@@ -126,7 +126,7 @@ Index: src/src/input/mpegts/pt1/pt1.c
 ===================================================================
 --- /dev/null
 +++ src/src/input/mpegts/pt1/pt1.c
-@@ -0,0 +1,1343 @@
+@@ -0,0 +1,1345 @@
 +/* pthread_timedjoin_np is a glibc extension; must be requested before
 + * any system header drags pthread.h in. */
 +#define _GNU_SOURCE
@@ -202,10 +202,9 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +
 +  int pfe_lnb_voltage;
 +
-+  /* one-shot warning flags for the SET_PID_FILTER ioctl path; reset on
-+   * each pt1_frontend_open_fd so a fresh tune gets a fresh chance to log */
++  /* one-shot warning for SET_PID_FILTER unsupported; reset on each
++   * pt1_frontend_open_fd so a fresh tune gets a fresh chance to log */
 +  uint8_t pfe_warned_pid_filter;
-+  uint8_t pfe_warned_pid_filter_overflow;
 +
 +  /* Cache of the PID set most recently pushed to the chardev. We skip
 +   * identical SET_PID_FILTER calls so we don't disturb the data flow
@@ -469,12 +468,11 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +  if (oldfd > 0)
 +    close(oldfd);
 +
-+  /* Fresh fd -- reset one-shot pid-filter warnings so a degraded path
++  /* Fresh fd -- reset one-shot pid-filter warning so a degraded path
 +   * still gets logged once per tune. Also clear the cached PID set
 +   * since the driver's release path restored the device-default
 +   * filter when the previous fd closed. */
 +  lfe->pfe_warned_pid_filter = 0;
-+  lfe->pfe_warned_pid_filter_overflow = 0;
 +  lfe->pfe_last_n = -1;
 +  lfe->pfe_last_pass = 0;
 +
@@ -662,11 +660,9 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +  if (ioctl(lfe->pfe_fd, SET_CHANNEL, &freq) != 0)
 +  {
 +    tvherror(LS_PT1, "%s - SET_CHANNEL failed [e=%s]", name, strerror(errno));
-+    if (errno != EAGAIN) {
-+      lfe->pfe_dvr_error = SM_CODE_TUNING_FAILED;
-+      pt1_frontend_close_fd(lfe, name);
-+      return NULL;
-+    }
++    lfe->pfe_dvr_error = SM_CODE_TUNING_FAILED;
++    pt1_frontend_close_fd(lfe, name);
++    return NULL;
 +  }
 +
 +  /* Pre-arm the hardware PID filter BEFORE START_REC so the chip's
@@ -1031,7 +1027,7 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +  int n = 0;
 +  int fd;
 +  int i;
-+  int overflow = 0;
++  int disable = 0;
 +
 +  if (lfe == NULL)
 +    return;
@@ -1043,28 +1039,26 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +  if (!mmi || mm != mmi->mmi_mux)
 +    return;
 +
-+  /* Collect the wanted PIDs. */
++  /* Collect the wanted PIDs. A full-mux subscription (sentinel
++   * MPEGTS_FULLMUX_PID present) or a set that exceeds the chip's
++   * slot count means we can't express the request as a PASS-mode
++   * filter — disable the hardware filter so every PID passes. */
 +  RB_FOREACH(mp, &mm->mm_pids, mp_link) {
++    if (mp->mp_pid == MPEGTS_FULLMUX_PID) { disable = 1; break; }
 +    if (mp->mp_pid == 0x1FFF) continue;
 +    if (mp->mp_pid >= MPEGTS_FULLMUX_PID) continue;
-+    if (n >= PTX_PID_FILTER_MAX_PIDS) { overflow = 1; break; }
++    if (n >= PTX_PID_FILTER_MAX_PIDS) { disable = 1; break; }
 +    pids[n++] = mp->mp_pid;
 +  }
 +
-+  if (overflow) {
-+    if (!lfe->pfe_warned_pid_filter_overflow) {
-+      tvhwarn(LS_PT1, "pid-filter overflow (>%d pids), disabling",
-+              PTX_PID_FILTER_MAX_PIDS);
-+      lfe->pfe_warned_pid_filter_overflow = 1;
-+    }
-+    /* Disable any active hardware filter; software demux still drops
-+     * unwanted PIDs at the output stage. */
++  if (disable) {
 +    if (lfe->pfe_last_n == 0 && lfe->pfe_last_pass == 0)
 +      return;  /* already disabled, nothing to do */
 +    memset(&f, 0, sizeof(f));   /* num=0 -> driver disables filter */
 +    (void)ioctl(fd, SET_PID_FILTER, &f);
 +    lfe->pfe_last_n = 0;
 +    lfe->pfe_last_pass = 0;
++    tvhinfo(LS_PT1, "pid-filter disabled");
 +    return;
 +  }
 +
@@ -1109,7 +1103,15 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +   * subsystem trace flags — lets us correlate against CC-error timestamps
 +   * during investigation. The cache check above keeps this from being
 +   * spammy in steady state. */
-+  tvhinfo(LS_PT1, "pid-filter applied (%d pids)", n);
++  {
++    char pidbuf[512];
++    int off = 0;
++    pidbuf[0] = 0;
++    for (i = 0; i < n && off < (int)sizeof(pidbuf) - 8; i++)
++      off += snprintf(pidbuf + off, sizeof(pidbuf) - off,
++                      "%s%04X", i ? "," : "", pids[i]);
++    tvhinfo(LS_PT1, "pid-filter applied (%d pids) [%s]", n, pidbuf);
++  }
 +}
 +
 +
