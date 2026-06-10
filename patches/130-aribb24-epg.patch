@@ -1,7 +1,5 @@
-Index: src/src/epggrab/module/eit.c
-===================================================================
---- src.orig/src/epggrab/module/eit.c
-+++ src/src/epggrab/module/eit.c
+--- a/src/epggrab/module/eit.c
++++ b/src/epggrab/module/eit.c
 @@ -81,6 +81,7 @@ typedef struct eit_data
  {
    tvh_uuid_t svc_uuid;
@@ -169,7 +167,7 @@ Index: src/src/epggrab/module/eit.c
      if (!ev->summary) ev->summary = lang_str_create();
      lang_str_add(ev->summary, buf, lang);
    }
-@@ -443,6 +550,21 @@ static int _eit_desc_ext_event
+@@ -443,6 +550,24 @@ static int _eit_desc_ext_event
      ilen -= r;
      iptr += r;
  
@@ -180,7 +178,10 @@ Index: src/src/epggrab/module/eit.c
 +    if (_eit_is_arib(ev) && *ival) {
 +      char eline[1100];
 +      if (*ikey)
-+        snprintf(eline, sizeof(eline), "\n%s\n%s", ikey, ival);
++        /* Blank line between key/value pairs for readability; no leading
++         * blanks on the first pair (ev->desc is still NULL until just below). */
++        snprintf(eline, sizeof(eline), "%s%s\n%s",
++                 ev->desc ? "\n\n" : "", ikey, ival);
 +      else
 +        snprintf(eline, sizeof(eline), "%s", ival);
 +      if (!ev->desc) ev->desc = lang_str_create();
@@ -191,7 +192,7 @@ Index: src/src/epggrab/module/eit.c
      /* Store */
      // TODO: extend existing?
  #if TODO_ADD_EXTRA
-@@ -540,6 +662,22 @@ static int _eit_desc_content
+@@ -540,6 +665,22 @@ static int _eit_desc_content
  {
    uint8_t tempPtr = 0;  //Temporary variable to hold a (potentially) changed *ptr value.
    tempPtr = *ptr;
@@ -214,7 +215,7 @@ Index: src/src/epggrab/module/eit.c
    while (len > 1) {
      //If the genre translation table has been loaded, it will not be a null pointer.
      if (epggrab_ota_genre_translation){
-@@ -697,6 +835,184 @@ static int _eit_desc_crid
+@@ -697,6 +838,187 @@ static int _eit_desc_crid
    return 0;
  }
  
@@ -371,12 +372,15 @@ Index: src/src/epggrab/module/eit.c
 +      master = epg_broadcast_find_by_eid(ch, r->eid);
 +      if (!master) continue;
 +
-+      /* Title: overwrite — the broadcaster's slave placeholder is what we
-+       * want to replace. */
-+      if (master->title) {
-+        if (ev->title) lang_str_destroy(ev->title);
++      /* Title: only adopt the master's when this event parsed no title of its
++       * own. A blank ARIB shared-slave short_event is already left NULL by
++       * _eit_str_has_content, so slaves still inherit the master's title; but
++       * an event that parsed its own (e.g. episode-number-enriched) title must
++       * keep it. The previous unconditional overwrite let a *stored*, stale
++       * master revert a freshly parsed title, so long-living instances never
++       * picked up an updated episode number. */
++      if (!ev->title && master->title)
 +        ev->title = lang_str_copy(master->title);
-+      }
 +      /* Secondary fields: only fill when slave provided nothing. */
 +      if (!ev->subtitle && master->subtitle)
 +        ev->subtitle = lang_str_copy(master->subtitle);
@@ -399,7 +403,7 @@ Index: src/src/epggrab/module/eit.c
  /*
   *
   */
-@@ -1108,7 +1424,16 @@ static int _eit_process_event_one
+@@ -1108,7 +1430,16 @@ static int _eit_process_event_one
    if (ev->copyright_year > 0)
      *save |= epg_broadcast_set_copyright_year(ebc, ev->copyright_year, &changes);
  
@@ -417,7 +421,7 @@ Index: src/src/epggrab/module/eit.c
  
  
  running:
-@@ -1196,6 +1521,14 @@ static int _eit_process_event
+@@ -1196,6 +1527,14 @@ static int _eit_process_event
        case DVB_DESC_CRID:
          r = _eit_desc_crid(mod, ptr, dlen, &ev, ed);
          break;
@@ -432,7 +436,7 @@ Index: src/src/epggrab/module/eit.c
        default:
          r = 0;
          _eit_dtag_dump(mod, dtag, dlen, ptr);
-@@ -1228,6 +1561,10 @@ static int _eit_process_event
+@@ -1228,6 +1567,10 @@ static int _eit_process_event
    if (lock)
      tvh_mutex_lock(&global_lock);
    svc = (mpegts_service_t *)service_find_by_uuid0(&ed->svc_uuid);
@@ -443,7 +447,7 @@ Index: src/src/epggrab/module/eit.c
    if (svc && eit_mod->opaque) {
      LIST_FOREACH(ilm, &svc->s_channels, ilm_in1_link) {
        ch = (channel_t *)ilm->ilm_in2;
-@@ -1360,29 +1697,21 @@ _eit_callback
+@@ -1360,29 +1703,21 @@ _eit_callback
        (hacks & EIT_HACK_INTEREST4E) != 0 /* uk_freesat hack */)
      ota = epggrab_ota_register((epggrab_module_ota_t*)mod, NULL, mm);
  
@@ -485,7 +489,7 @@ Index: src/src/epggrab/module/eit.c
      int range        = (tableid & 0x08) ? 1 : 0;
      int tid_off      = tableid & 0x07;
      eit_section_state_t *est = eit_section_state_get(map);
-@@ -1390,10 +1719,10 @@ _eit_callback
+@@ -1390,10 +1725,10 @@ _eit_callback
      eit_section_flag_t  *F = range ? &ssvc->extended[tid_off]
                                     : &ssvc->basic[tid_off];
      int i, s;
@@ -498,7 +502,7 @@ Index: src/src/epggrab/module/eit.c
      }
      F->flag[segment] |= 1u << sub;
      for (i = seg_last_sub + 1; i < 8; i++)
-@@ -1403,6 +1732,21 @@ _eit_callback
+@@ -1403,6 +1738,21 @@ _eit_callback
      eit_section_mark_tids_above(ssvc, last_table_id);
    }
  
@@ -520,7 +524,7 @@ Index: src/src/epggrab/module/eit.c
    /* UK Cable Virgin: EPG data for services in other transponders is transmitted
    // in the 'actual' transpoder table IDs */
    if ((hacks & EIT_HACK_EXTRAMUXLOOKUP) != 0 && (tableid == 0x50 || tableid == 0x4E)) {
-@@ -1477,6 +1821,7 @@ svc_ok:
+@@ -1477,6 +1827,7 @@ svc_ok:
      data->sect = sect;
      data->svc_uuid = svc->s_id.in_uuid;
      data->onid = onid;
@@ -528,7 +532,7 @@ Index: src/src/epggrab/module/eit.c
      data->local_time = mm->mm_network->mn_localtime;
      if (cridauth_len) {
        data->cridauth_len = cridauth_len;
-@@ -1526,6 +1871,7 @@ static int _eit_start
+@@ -1526,6 +1877,7 @@ static int _eit_start
  static int _eit_stop
    ( epggrab_ota_map_t *map, mpegts_mux_t *dm )
  {
@@ -536,10 +540,8 @@ Index: src/src/epggrab/module/eit.c
    eit_section_state_free(map);
    return 0;
  }
-Index: src/src/input/mpegts/dvb.h
-===================================================================
---- src.orig/src/input/mpegts/dvb.h
-+++ src/src/input/mpegts/dvb.h
+--- a/src/input/mpegts/dvb.h
++++ b/src/input/mpegts/dvb.h
 @@ -178,6 +178,8 @@ struct lang_str;
  #define DVB_DESC_FREESAT_REGIONS      0xD4
  
