@@ -76,12 +76,16 @@ jobs:
               git config --global --add safe.directory "*"
               export AUTOBUILD_CONFIGURE_EXTRA="--disable-ffmpeg_static --disable-hdhomerun_static --disable-libfdkaac_static --disable-libmfx_static --disable-libopus_static --disable-libtheora_static --disable-libvorbis_static --disable-libvpx_static --disable-libx264_static --disable-libx265_static --enable-hdhomerun_client --enable-libav --enable-aribb24 --enable-aribb25 --python=python3"
               ./Autobuild.sh -j"$(nproc)"
+              # standalone EPG extractor: link the just-built objects (the deb
+              # build leaves them in build.linux) and package its own .deb.
+              make -C /ws/epgextract
+              sh /ws/epgextract/mkdeb.sh /ws
             '
 
       - name: Collect packages
         run: |
           mkdir -p dist
-          cp tvheadend*.deb dist/
+          cp tvheadend*.deb dist/          # includes tvheadend-epgextract*.deb
           ls -la dist/
 
       - name: Upload artifacts

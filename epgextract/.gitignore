@@ -1,0 +1,4 @@
+/tvhepg-extract
+*.o
+*.deb
+/sample.ts

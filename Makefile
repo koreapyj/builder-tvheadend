@@ -119,9 +119,9 @@ build: image
 	@test -d $(SRC) || { echo "No $(SRC)/ — run 'make prepare' (or 'make prepare QUILT=1') first"; exit 1; }
 	docker run --rm \
 		-v "$(CURDIR):/ws" -w /ws/$(SRC) "$(BUILDER_IMAGE)" \
-		bash -euxc './configure $(BUILD_CONFIGURE) && make -j"$$(nproc)" && chown -R "$$(stat -c %u:%g /ws)" .'
+		bash -euxc './configure $(BUILD_CONFIGURE) && make -j"$$(nproc)" && make -C /ws/epgextract && chown -R "$$(stat -c %u:%g /ws)" . /ws/epgextract'
 	@echo
-	@echo 'Built: $(SRC)/build.linux/tvheadend'
+	@echo 'Built: $(SRC)/build.linux/tvheadend  and  epgextract/tvhepg-extract'
 
 run: image
 	@test -x $(SRC)/build.linux/tvheadend || { echo "Not built — run 'make build' first"; exit 1; }
