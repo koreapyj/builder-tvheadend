@@ -126,7 +126,7 @@ Index: src/src/input/mpegts/pt1/pt1.c
 ===================================================================
 --- /dev/null
 +++ src/src/input/mpegts/pt1/pt1.c
-@@ -0,0 +1,1395 @@
+@@ -0,0 +1,1416 @@
 +/* pthread_timedjoin_np is a glibc extension; must be requested before
 + * any system header drags pthread.h in. */
 +#define _GNU_SOURCE
@@ -202,8 +202,9 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +
 +  int pfe_lnb_voltage;
 +
-+  /* one-shot warning for SET_PID_FILTER unsupported; reset on each
-+   * pt1_frontend_open_fd so a fresh tune gets a fresh chance to log */
++  /* SET_PID_FILTER unsupported latch and its one-shot warning. Both reset
++   * when a fresh fd is opened, because a newly loaded driver may support it. */
++  uint8_t pfe_pid_filter_unsupported;
 +  uint8_t pfe_warned_pid_filter;
 +
 +  /* Cache of the PID set most recently pushed to the chardev. We skip
@@ -468,10 +469,11 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +  if (oldfd > 0)
 +    close(oldfd);
 +
-+  /* Fresh fd -- reset one-shot pid-filter warning so a degraded path
-+   * still gets logged once per tune. Also clear the cached PID set
-+   * since the driver's release path restored the device-default
-+   * filter when the previous fd closed. */
++  /* Fresh fd -- reset the unsupported latch and its one-shot warning: a
++   * newly opened device may be backed by a driver that now implements the
++   * ioctl. Also clear the cached PID set since the driver's release path
++   * restored the device-default filter when the previous fd closed. */
++  lfe->pfe_pid_filter_unsupported = 0;
 +  lfe->pfe_warned_pid_filter = 0;
 +  lfe->pfe_last_n = -1;
 +  lfe->pfe_last_pass = 0;
@@ -673,10 +675,10 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +   * reports a spurious CC error.
 +   *
 +   * mm_pids is already populated by psi_tables_install (PAT/CAT/NIT/
-+   * SDT/BAT/EIT/TDT/CDT all opened during start_mux), so the filter
-+   * we install here has the full essential-PSI set. We hold
-+   * mi_output_lock and clear mm_update_pids_flag the same way the
-+   * framework's mpegts_mux_update_pids_cb does. */
++   * SDT/BAT, plus configured TDT/TOT and CDT), so the filter we install
++   * here has the essential PSI set. EIT (0x0012) is added later by the
++   * EPG grabber. We hold mi_output_lock and clear mm_update_pids_flag the
++   * same way the framework's mpegts_mux_update_pids_cb does. */
 +  {
 +    mpegts_input_t *mi = (mpegts_input_t *)lfe;
 +    mpegts_mux_t   *mm = mmi->mmi_mux;
@@ -781,6 +783,13 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +  if (!lfe->pfe_locked) {
 +    lfe->pfe_locked = 1;
 +
++    /* Install PSI tables before the input thread can pre-arm the hardware
++     * PID filter. psi_tables_install queues mi_update_pids, but no fd is
++     * open yet; the thread's pre-arm call below applies this complete set
++     * before START_REC. */
++    psi_tables_install((mpegts_input_t *)lfe, mm,
++                       ((dvb_mux_t *)mm)->lm_tuning.dmc_fe_delsys);
++
 +    tvh_mutex_lock(&lfe->pfe_dvr_lock);
 +    if (lfe->pfe_thread_started == 0)
 +    {
@@ -800,10 +809,6 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +      tvherror(LS_PT1, "pfe_thread_started already?");
 +    }
 +    tvh_mutex_unlock(&lfe->pfe_dvr_lock);
-+
-+    /* Table handlers */
-+    psi_tables_install((mpegts_input_t *)lfe, mm,
-+                        ((dvb_mux_t *)mm)->lm_tuning.dmc_fe_delsys);
 +  } else {
 +    if (mclk() < lfe->pfe_monitor)
 +      return;
@@ -1000,20 +1005,43 @@ Index: src/src/input/mpegts/pt1/pt1.c
 + * mpegts framework whenever mm->mm_pids changes.
 + *
 + * By the time this fires for the first time, psi_tables_install has
-+ * already synchronously added PAT/CAT/NIT/SDT/BAT/EIT/TDT/CDT via
-+ * mpegts_table_add -> mpegts_input_open_pid, so essential PSI PIDs are
++ * already synchronously added PAT/CAT/NIT/SDT/BAT, plus configured
++ * TDT/TOT and CDT, via mpegts_table_add -> mpegts_input_open_pid.
++ * EIT is added later by the EPG grabber. Essential PSI PIDs are therefore
 + * already in mm_pids -- no manual union needed.
 + *
 + * Skips internal sentinel PIDs (MPEGTS_FULLMUX_PID / MPEGTS_TABLES_PID)
 + * and 0x1FFF (null packets). On overflow we disable the hardware filter
-+ * and rely on the software demux. On ENOSYS/ENOTTY/EINVAL we warn once
-+ * and proceed -- works against pre-Part-A px4_drv too.
++ * and rely on the software demux. ENOSYS/ENOTTY/EINVAL latch the ioctl as
++ * unsupported for the lifetime of the current fd; EBUSY is retried later.
 + */
 +static int
 +pt1_pid_cmp_u16 ( const void *a, const void *b )
 +{
 +  uint16_t x = *(const uint16_t *)a, y = *(const uint16_t *)b;
 +  return (x > y) - (x < y);
++}
++
++static int
++pt1_pid_filter_ioctl ( pt1_frontend_t *lfe, int fd,
++                       struct ptx_pid_filter *f )
++{
++  if (ioctl(fd, SET_PID_FILTER, f) == 0)
++    return 0;
++
++  if (errno == ENOSYS || errno == ENOTTY || errno == EINVAL) {
++    if (!lfe->pfe_warned_pid_filter) {
++      tvhwarn(LS_PT1, "SET_PID_FILTER unsupported (errno=%d), software-only",
++              errno);
++      lfe->pfe_warned_pid_filter = 1;
++    }
++    lfe->pfe_pid_filter_unsupported = 1;
++  } else if (errno == EBUSY) {
++    tvhdebug(LS_PT1, "SET_PID_FILTER busy; will retry");
++  } else {
++    tvhdebug(LS_PT1, "SET_PID_FILTER failed: %s; will retry", strerror(errno));
++  }
++  return -1;
 +}
 +
 +static void
@@ -1038,6 +1066,8 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +  mmi = LIST_FIRST(&lfe->mi_mux_active);
 +  if (!mmi || mm != mmi->mmi_mux)
 +    return;
++  if (lfe->pfe_pid_filter_unsupported)
++    return;
 +
 +  /* Collect the wanted PIDs. A full-mux subscription (sentinel
 +   * MPEGTS_FULLMUX_PID present) or a set that exceeds the chip's
@@ -1051,11 +1081,12 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +    pids[n++] = mp->mp_pid;
 +  }
 +
-+  if (disable) {
++  if (disable || n <= 0) {
 +    if (lfe->pfe_last_n == 0 && lfe->pfe_last_pass == 0)
 +      return;  /* already disabled, nothing to do */
 +    memset(&f, 0, sizeof(f));   /* num=0 -> driver disables filter */
-+    (void)ioctl(fd, SET_PID_FILTER, &f);
++    if (pt1_pid_filter_ioctl(lfe, fd, &f) < 0)
++      return;
 +    lfe->pfe_last_n = 0;
 +    lfe->pfe_last_pass = 0;
 +    tvhinfo(LS_PT1, "pid-filter disabled");
@@ -1081,18 +1112,8 @@ Index: src/src/input/mpegts/pt1/pt1.c
 +  for (i = 0; i < n; i++)
 +    f.pid[i] = pids[i];
 +
-+  if (ioctl(fd, SET_PID_FILTER, &f) < 0) {
-+    if (errno == ENOSYS || errno == ENOTTY || errno == EINVAL) {
-+      if (!lfe->pfe_warned_pid_filter) {
-+        tvhwarn(LS_PT1, "SET_PID_FILTER unsupported (errno=%d), software-only",
-+                errno);
-+        lfe->pfe_warned_pid_filter = 1;
-+      }
-+    } else {
-+      tvherror(LS_PT1, "SET_PID_FILTER failed: %s", strerror(errno));
-+    }
++  if (pt1_pid_filter_ioctl(lfe, fd, &f) < 0)
 +    return;
-+  }
 +
 +  /* Cache for next call so we can skip identical re-applies. */
 +  lfe->pfe_last_n = n;
